@@ -43,6 +43,7 @@ ALTER TABLE jobs_migration RENAME TO jobs;
 CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
 )SQL"},
+    {3, "ALTER TABLE jobs ADD COLUMN scheduled_at TEXT NOT NULL DEFAULT '';"},
 };
 
 
@@ -315,7 +316,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     payload TEXT NOT NULL DEFAULT '',
     output TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
-    attempts INTEGER NOT NULL DEFAULT 0
+    attempts INTEGER NOT NULL DEFAULT 0,
+    scheduled_at TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
@@ -664,6 +666,7 @@ std::optional<Job> Database::claim_next_job() {
 SELECT j.id,j.repo_id,j.type,j.status,j.queued_at,j.started_at,j.finished_at,j.message,j.payload,j.output,j.error,j.attempts
 FROM jobs j LEFT JOIN repositories r ON r.id=j.repo_id
 WHERE j.status='queued' AND (j.repo_id IS NULL OR r.paused=0)
+ AND (j.scheduled_at = '' OR j.scheduled_at <= datetime('now'))
  AND (j.repo_id IS NULL OR NOT EXISTS (
    SELECT 1 FROM jobs running WHERE running.repo_id=j.repo_id AND running.status='running'
  ))
@@ -703,11 +706,32 @@ void Database::finish_job(std::int64_t job_id, bool success, const std::string& 
     stmt.step_done();
 }
 
-void Database::requeue_job(std::int64_t job_id, const std::string& message) {
+void Database::requeue_job(std::int64_t job_id, const std::string& message, int delay_seconds) {
     Connection db(path_);
-    Statement stmt(db.get(), "UPDATE jobs SET status='queued', started_at='', message=? WHERE id=?");
+    // The delay is computed in SQL (datetime('now', '+N seconds')) rather than formatted
+    // in C++, so it's guaranteed to use the exact same "YYYY-MM-DD HH:MM:SS" format that
+    // claim_next_job compares scheduled_at against — now_utc() produces a different
+    // (ISO 8601 'T'/'Z') format that would silently never compare as due.
+    Statement stmt(db.get(),
+        "UPDATE jobs SET status='queued', started_at='', message=?, "
+        "scheduled_at = CASE WHEN ?2 > 0 THEN datetime('now', '+' || ?2 || ' seconds') ELSE '' END "
+        "WHERE id=?3");
     stmt.bind(1, message);
-    stmt.bind(2, job_id);
+    stmt.bind(2, delay_seconds);
+    stmt.bind(3, job_id);
+    stmt.step_done();
+}
+
+void Database::delay_pending_github_jobs(int delay_seconds) {
+    Connection db(path_);
+    // Called when one job discovers the GitHub API rate limit has been hit, so every
+    // other job that would otherwise immediately retry the same exhausted quota backs
+    // off too, instead of each independently burning an attempt to rediscover it.
+    Statement stmt(db.get(),
+        "UPDATE jobs SET scheduled_at = datetime('now', '+' || ?1 || ' seconds') "
+        "WHERE type IN ('metadata','account') AND status='queued' "
+        "AND (scheduled_at = '' OR scheduled_at < datetime('now', '+' || ?1 || ' seconds'))");
+    stmt.bind(1, delay_seconds);
     stmt.step_done();
 }
 

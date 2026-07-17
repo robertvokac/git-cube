@@ -142,7 +142,11 @@ public:
     std::optional<Job> claim_next_job();
     void finish_job(std::int64_t job_id, bool success, const std::string& output,
                     const std::string& error);
-    void requeue_job(std::int64_t job_id, const std::string& message = {});
+    // delay_seconds > 0 makes the job ineligible for claim_next_job() until that many
+    // seconds from now, instead of immediately — used to back off after a transient
+    // failure like a GitHub API rate limit rather than spinning in a tight retry loop.
+    void requeue_job(std::int64_t job_id, const std::string& message = {}, int delay_seconds = 0);
+    void delay_pending_github_jobs(int delay_seconds);
     void update_job_message(std::int64_t job_id, const std::string& message);
     std::vector<Job> recent_jobs(std::size_t limit = 50) const;
     std::int64_t active_job_count() const;

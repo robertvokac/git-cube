@@ -20,6 +20,20 @@ struct JobExecutionResult {
     // queue (repository paused mid-run, or the operation was killed by a graceful
     // shutdown) rather than recorded as a permanent failure.
     bool requeue = false;
+    // When requeue is set, how long to wait before the job is eligible to run again;
+    // 0 means immediately. Used to back off after a transient failure like a GitHub API
+    // rate limit instead of spinning in a tight retry loop.
+    int requeue_delay_seconds = 0;
+};
+
+// Result of a single GitHub REST API GET: the HTTP status (0 if no response was ever
+// received, e.g. a DNS/connection failure) and the response body with the trailing
+// status-code marker curl was asked to append already stripped off.
+struct GitHubApiResult {
+    bool interrupted = false;
+    int curl_exit_code = -1;
+    int status = 0;
+    std::string body;
 };
 
 struct TreeEntry {
@@ -81,6 +95,8 @@ private:
     JobExecutionResult synchronize_repository_state(const Repository& repo, bool fetched,
                                                      std::string prefix_output = {});
     std::string classify_git_failure(const std::string& output) const;
+    GitHubApiResult github_api_get(const std::string& url) const;
+    static bool is_github_rate_limited(const GitHubApiResult& result);
 };
 
 } // namespace gitcube

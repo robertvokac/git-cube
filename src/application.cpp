@@ -169,7 +169,7 @@ void Application::worker_loop(int worker_number) {
             database_.update_job_message(job->id, "Worker " + std::to_string(worker_number) + " started " + job->type);
             auto result = git_.execute(*job);
             if (result.requeue) {
-                database_.requeue_job(job->id, result.error);
+                database_.requeue_job(job->id, result.error, result.requeue_delay_seconds);
             } else {
                 database_.finish_job(job->id, result.success, result.output, result.error);
             }
