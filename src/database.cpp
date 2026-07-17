@@ -8,6 +8,44 @@
 namespace gitcube {
 namespace {
 
+// Ordered, additive schema migrations. Each entry's `sql` is applied once, in a single
+// transaction, when the database's current version is below `version`; the version is
+// then recorded in schema_migrations. To change the schema in the future, append a new
+// entry here — never edit an already-released one — so both fresh databases (which start
+// from the CREATE TABLE statements in Database::initialize() reflecting the *latest*
+// schema) and upgraded databases (which replay every migration newer than their current
+// version) converge on the same result.
+struct Migration {
+    int version;
+    const char* sql;
+};
+
+const Migration kMigrations[] = {
+    {2, R"SQL(
+CREATE TABLE jobs_migration (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
+    type TEXT NOT NULL CHECK(type IN ('clone','fetch','health','metadata','account')),
+    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','success','failed','interrupted')),
+    queued_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL DEFAULT '',
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO jobs_migration (id, repo_id, type, status, queued_at, started_at, finished_at, message, output, error, attempts)
+  SELECT id, repo_id, type, status, queued_at, started_at, finished_at, message, output, error, attempts FROM jobs;
+DROP TABLE jobs;
+ALTER TABLE jobs_migration RENAME TO jobs;
+CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
+CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
+)SQL"},
+};
+
+
 class Connection {
 public:
     explicit Connection(const std::filesystem::path& path) {
@@ -95,6 +133,31 @@ private:
     sqlite3* db_ = nullptr;
     sqlite3_stmt* stmt_ = nullptr;
 };
+
+void run_pending_migrations(Connection& db) {
+    std::int64_t schema_version = 0;
+    {
+        // Finalized before any migration DDL runs on the same connection — an
+        // unfinalized statement holds a schema-level lock that would make a migration's
+        // CREATE/DROP/ALTER TABLE sequence fail with "database table is locked".
+        Statement version_stmt(db.get(), "SELECT COALESCE(max(version), 0) FROM schema_migrations");
+        schema_version = version_stmt.step_row() ? version_stmt.integer(0) : 0;
+    }
+    for (const auto& migration : kMigrations) {
+        if (migration.version <= schema_version) continue;
+        db.exec("BEGIN IMMEDIATE;");
+        try {
+            db.exec(migration.sql);
+            Statement record(db.get(), "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(?, datetime('now'))");
+            record.bind(1, static_cast<std::int64_t>(migration.version));
+            record.step_done();
+            db.exec("COMMIT;");
+        } catch (...) {
+            db.exec("ROLLBACK;");
+            throw;
+        }
+    }
+}
 
 Repository read_repository(Statement& stmt) {
     Repository r;
@@ -285,52 +348,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime('now'));
 )SQL");
 
-    // A database file created before the "payload" column / "account" job type existed
-    // has a jobs table with the old 11-column schema and the old CHECK(type IN (...))
-    // constraint; CREATE TABLE IF NOT EXISTS above is a no-op against it, so every job
-    // query referencing j.payload (and every "account" job insert) would fail. Rebuild
-    // the table in place instead. This also runs harmlessly on a brand-new database,
-    // where the jobs table already has the current schema and there's nothing to move.
-    std::int64_t schema_version = 0;
-    {
-        // Finalize this statement before the migration below runs DDL on the same
-        // connection — an unfinalized statement holds a schema-level lock that would
-        // make the CREATE/DROP/ALTER TABLE sequence fail with "database table is locked".
-        Statement version_stmt(db.get(), "SELECT COALESCE(max(version), 0) FROM schema_migrations");
-        schema_version = version_stmt.step_row() ? version_stmt.integer(0) : 0;
-    }
-    if (schema_version < 2) {
-        db.exec("BEGIN IMMEDIATE;");
-        try {
-            db.exec(R"SQL(
-CREATE TABLE jobs_migration (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
-    type TEXT NOT NULL CHECK(type IN ('clone','fetch','health','metadata','account')),
-    status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','success','failed','interrupted')),
-    queued_at TEXT NOT NULL,
-    started_at TEXT NOT NULL DEFAULT '',
-    finished_at TEXT NOT NULL DEFAULT '',
-    message TEXT NOT NULL DEFAULT '',
-    payload TEXT NOT NULL DEFAULT '',
-    output TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT '',
-    attempts INTEGER NOT NULL DEFAULT 0
-);
-INSERT INTO jobs_migration (id, repo_id, type, status, queued_at, started_at, finished_at, message, output, error, attempts)
-  SELECT id, repo_id, type, status, queued_at, started_at, finished_at, message, output, error, attempts FROM jobs;
-DROP TABLE jobs;
-ALTER TABLE jobs_migration RENAME TO jobs;
-CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
-CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
-INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(2, datetime('now'));
-)SQL");
-            db.exec("COMMIT;");
-        } catch (...) {
-            db.exec("ROLLBACK;");
-            throw;
-        }
-    }
+    // The block above only creates tables that don't exist yet, so on an existing
+    // database file it's a no-op even when the schema it describes has moved on since
+    // that file was created. Bring such a database up to date explicitly.
+    run_pending_migrations(db);
 }
 
 void Database::recover_interrupted_jobs() {
