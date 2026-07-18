@@ -132,17 +132,30 @@ jobs:
           )
           test "${#coverage_files[@]}" -ge 8
           gcovr "${coverage_files[@]}" \
+            -j 1 \
             --root . \
             --filter 'src/' \
             --exclude 'src/main.cpp' \
+            --gcov-executable gcov \
+            --gcov-ignore-errors all \
+            --gcov-ignore-parse-errors negative_hits.warn \
             --txt-summary \
             --xml coverage.xml \
             --xml-pretty \
-            --fail-under-line 30
+            --fail-under-line 30 2>&1 | tee coverage.log
           test -s coverage.xml
+          expected_sources=(
+            application.cpp data_directory_lock.cpp database.cpp git_service.cpp
+            http_server.cpp json.cpp process.cpp util.cpp
+          )
+          for source in "${expected_sources[@]}"; do
+            grep -Fq "filename=\"src/${source}\"" coverage.xml
+          done
       - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: coverage-report
-          path: coverage.xml
+          path: |
+            coverage.xml
+            coverage.log
           if-no-files-found: error
