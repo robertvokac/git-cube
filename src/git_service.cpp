@@ -8,7 +8,10 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
 
 namespace gitcube {
@@ -58,26 +61,149 @@ std::string process_error(const ProcessResult& result) {
     return trim(result.output + "\n" + result.error_output);
 }
 
-// GitHub returns this shape (HTTP 403, or 429 for the secondary/abuse limit) when the
-// caller has exhausted its request quota; unauthenticated requests are capped at 60/hour
-// per IP, which a bulk account import (one metadata fetch per repository) can exhaust
-// quickly. Fifteen minutes is a conservative wait — GitHub's actual reset window is at
-// most an hour — chosen so this doesn't need to parse the X-RateLimit-Reset header.
-constexpr int kGitHubRateLimitBackoffSeconds = 15 * 60;
+constexpr int kGitHubFallbackBackoffSeconds = 15 * 60;
+constexpr int kGitHubMaxPaginationPages = 1000;
+constexpr std::size_t kGitHubMaxResponseBytes = 8 * 1024 * 1024;
+// Accounted record content is capped at 16 MiB, leaving another 16 MiB for vector
+// spare capacity/allocator overhead under the documented 32 MiB accumulation budget.
+constexpr std::size_t kGitHubMaxCollectedReleaseBytes = 16 * 1024 * 1024;
+
+std::optional<std::int64_t> parse_int64(std::string_view value) {
+    const std::string cleaned = trim(value);
+    std::int64_t result = 0;
+    const auto [ptr, ec] =
+        std::from_chars(cleaned.data(), cleaned.data() + cleaned.size(), result);
+    if (ec != std::errc{} || ptr != cleaned.data() + cleaned.size()) return std::nullopt;
+    return result;
+}
+
+bool github_api_url(std::string_view url) {
+    return url.starts_with("https://api.github.com/");
+}
 
 } // namespace
 
+void apply_github_response_headers(std::string_view headers, GitHubApiResult& result) {
+    std::unordered_map<std::string, std::string> current;
+    std::unordered_map<std::string, std::string> final_headers;
+    bool in_response = false;
+    for (const auto& raw_line : split_lines(headers)) {
+        const std::string line =
+            !raw_line.empty() && raw_line.back() == '\r'
+                ? raw_line.substr(0, raw_line.size() - 1)
+                : raw_line;
+        if (line.starts_with("HTTP/")) {
+            current.clear();
+            in_response = true;
+            continue;
+        }
+        if (line.empty()) {
+            if (in_response) final_headers = current;
+            in_response = false;
+            continue;
+        }
+        if (!in_response) continue;
+        const auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        const std::string name = to_lower(trim(line.substr(0, colon)));
+        const std::string value = trim(line.substr(colon + 1));
+        const auto existing = current.find(name);
+        if (existing == current.end()) current.emplace(name, value);
+        else existing->second += ", " + value;
+    }
+    if (in_response) final_headers = current;
+
+    result.rate_limit_remaining = -1;
+    result.rate_limit_reset = 0;
+    result.retry_after_seconds = 0;
+    result.next_url.clear();
+    result.next_url_rejected = false;
+    if (const auto it = final_headers.find("x-ratelimit-remaining");
+        it != final_headers.end()) {
+        if (const auto value = parse_int64(it->second)) {
+            result.rate_limit_remaining = *value;
+        }
+    }
+    if (const auto it = final_headers.find("x-ratelimit-reset");
+        it != final_headers.end()) {
+        if (const auto value = parse_int64(it->second)) result.rate_limit_reset = *value;
+    }
+    if (const auto it = final_headers.find("retry-after"); it != final_headers.end()) {
+        if (const auto value = parse_int64(it->second); value && *value > 0) {
+            result.retry_after_seconds = static_cast<int>(
+                std::min<std::int64_t>(*value, std::numeric_limits<int>::max()));
+        }
+    }
+
+    const auto link = final_headers.find("link");
+    if (link == final_headers.end()) return;
+    std::size_t start = 0;
+    while (start < link->second.size()) {
+        const auto comma = link->second.find(',', start);
+        const std::string_view part(link->second.data() + start,
+            (comma == std::string::npos ? link->second.size() : comma) - start);
+        const auto open = part.find('<');
+        const auto close = part.find('>', open == std::string_view::npos ? 0 : open + 1);
+        if (open != std::string_view::npos && close != std::string_view::npos) {
+            const std::string_view attributes = part.substr(close + 1);
+            if (attributes.find("rel=\"next\"") != std::string_view::npos ||
+                attributes.find("rel=next") != std::string_view::npos) {
+                const std::string candidate(part.substr(open + 1, close - open - 1));
+                if (github_api_url(candidate)) result.next_url = candidate;
+                else result.next_url_rejected = true;
+                return;
+            }
+        }
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+}
+
+int github_rate_limit_backoff_seconds(const GitHubApiResult& result,
+                                      std::int64_t now_epoch_seconds,
+                                      std::uint64_t jitter_seed) {
+    std::int64_t delay = kGitHubFallbackBackoffSeconds;
+    if (result.retry_after_seconds > 0) {
+        delay = result.retry_after_seconds;
+    } else if (result.rate_limit_reset > now_epoch_seconds) {
+        delay = result.rate_limit_reset - now_epoch_seconds + 5;
+    }
+    delay += static_cast<std::int64_t>(jitter_seed % 30U);
+    delay = std::clamp<std::int64_t>(delay, 5, 24 * 60 * 60);
+    return static_cast<int>(delay);
+}
+
 GitHubApiResult GitService::github_api_get(const std::string& url) const {
+    if (!github_api_url(url)) {
+        GitHubApiResult rejected;
+        rejected.body = "Rejected off-origin GitHub API URL";
+        return rejected;
+    }
+    std::lock_guard api_guard(github_api_request_mutex_);
+    if (shutdown_requested_.load(std::memory_order_relaxed)) {
+        GitHubApiResult interrupted;
+        interrupted.interrupted = true;
+        return interrupted;
+    }
+    std::filesystem::create_directories(data_dir_ / "tmp");
+    const auto serial = temporary_file_counter_.fetch_add(1, std::memory_order_relaxed);
+    const auto headers_path = data_dir_ / "tmp" /
+        ("github-headers-" + std::to_string(static_cast<long long>(getpid())) + "-" +
+         std::to_string(serial) + ".tmp");
     auto result = ProcessRunner::run(
-        {"curl", "--disable", "--silent", "--show-error", "--location",
-         "--proto", "=https", "--proto-redir", "=https", "--max-time", "30",
+        {"curl", "--disable", "--silent", "--show-error",
+         "--proto", "=https", "--max-time", "30",
+         "--max-filesize", std::to_string(kGitHubMaxResponseBytes),
+         "--dump-header", headers_path.string(),
          "--header", "Accept: application/vnd.github+json",
          "--header", "X-GitHub-Api-Version: 2022-11-28",
          "--user-agent", "GitCube/0.1", "--write-out", "\n%{http_code}", url},
-        {}, &shutdown_requested_, std::chrono::seconds(45));
+        {}, &shutdown_requested_, std::chrono::seconds(45), std::chrono::seconds(10),
+        kGitHubMaxResponseBytes + 1024);
 
     GitHubApiResult api;
     api.interrupted = result.interrupted;
+    api.response_too_large = result.output_too_large || result.exit_code == 63;
     api.curl_exit_code = result.exit_code;
     api.body = std::move(result.output);
     if (api.curl_exit_code != 0 && !result.error_output.empty()) {
@@ -94,16 +220,44 @@ GitHubApiResult GitService::github_api_get(const std::string& url) const {
             }
         }
     }
+    {
+        std::ifstream headers_input(headers_path, std::ios::binary);
+        const std::string headers((std::istreambuf_iterator<char>(headers_input)),
+                                  std::istreambuf_iterator<char>());
+        apply_github_response_headers(headers, api);
+    }
+    std::error_code remove_error;
+    std::filesystem::remove(headers_path, remove_error);
     return api;
 }
 
 bool GitService::is_github_rate_limited(const GitHubApiResult& result) {
-    if (result.status != 403 && result.status != 429) return false;
+    if (result.status == 429) return true;
+    if (result.status != 403) return false;
+    if (result.rate_limit_remaining == 0 || result.retry_after_seconds > 0) return true;
     std::string lower = to_lower(result.body);
-    return lower.find("rate limit") != std::string::npos;
+    return lower.find("rate limit") != std::string::npos ||
+           lower.find("secondary limit") != std::string::npos;
 }
 
 namespace {
+
+std::int64_t unix_time_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+int transient_backoff_seconds(const Job& job) {
+    const int exponent = std::clamp(job.attempts - 1, 0, 4);
+    const int base = 30 * (1 << exponent);
+    return base + static_cast<int>(static_cast<std::uint64_t>(job.id) % 30U);
+}
+
+bool transient_github_failure(const GitHubApiResult& result) {
+    return !result.response_too_large &&
+           (result.curl_exit_code != 0 || result.status == 500 ||
+            result.status == 502 || result.status == 503 || result.status == 504);
+}
 
 std::vector<std::string_view> split_view(std::string_view input, char delimiter) {
     std::vector<std::string_view> values;
@@ -379,18 +533,29 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
         return requeue_result(std::move(metadata.body), "Metadata request interrupted by shutdown; job requeued");
     }
     if (is_github_rate_limited(metadata)) {
-        database_.delay_pending_github_jobs(kGitHubRateLimitBackoffSeconds);
+        const int delay = github_rate_limit_backoff_seconds(
+            metadata, unix_time_now(), static_cast<std::uint64_t>(job.id));
+        database_.delay_pending_github_jobs(delay);
         database_.update_repository_metadata_status(
             repo.id, "rate-limited",
             "GitHub API rate limit reached; will retry automatically later");
         return requeue_result(std::move(metadata.body), "GitHub API rate limit reached; will retry automatically later",
-                              kGitHubRateLimitBackoffSeconds);
+                              delay);
     }
     if (metadata.curl_exit_code != 0 || metadata.status < 200 || metadata.status >= 300) {
+        const std::string diagnostic = metadata.response_too_large
+            ? "GitHub metadata response exceeded the 8 MiB limit"
+            : "GitHub metadata request failed (HTTP " +
+                  std::to_string(metadata.status) + ")";
         database_.update_repository_metadata_status(repo.id, "error",
-                                                    trim(metadata.body));
-        return {false, metadata.body,
-               "GitHub metadata request failed (HTTP " + std::to_string(metadata.status) + ")"};
+                                                    trim(metadata.body).empty()
+                                                        ? diagnostic
+                                                        : trim(metadata.body));
+        if (transient_github_failure(metadata) && job.attempts < 5) {
+            return requeue_result(std::move(metadata.body), diagnostic,
+                                  transient_backoff_seconds(job));
+        }
+        return {false, metadata.body, diagnostic};
     }
 
     std::string parse_error;
@@ -415,39 +580,100 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
         json_integer(*json, "forks_count"), json_integer(*json, "open_issues_count"),
         json_string(*json, "created_at"), json_string(*json, "updated_at"),
         json_string(*json, "pushed_at"), metadata.body);
+    const std::string metadata_output =
+        metadata.body.substr(0, std::min<std::size_t>(metadata.body.size(), 64 * 1024));
+    std::string{}.swap(metadata.body);
+    json.reset();
 
-    database_.update_job_message(job.id, "Downloading public GitHub releases");
-    const std::string releases_api = api + "/releases?per_page=100";
-    auto releases_result = github_api_get(releases_api);
-    if (releases_result.interrupted) {
-        return requeue_result(metadata.body + "\n" + releases_result.body,
-                              "Releases request interrupted by shutdown; job requeued");
-    }
-    if (is_github_rate_limited(releases_result)) {
-        database_.delay_pending_github_jobs(kGitHubRateLimitBackoffSeconds);
-        // The repository's own metadata already saved successfully above; only the
-        // releases list is missing. Leave the repo "ready" and let the next scheduled
-        // metadata refresh pick up releases rather than requeuing the whole job.
-        return {true, metadata.body + "\n" + releases_result.body,
-               "GitHub API rate limit reached while listing releases; will retry on the next metadata refresh"};
-    }
-    if (releases_result.curl_exit_code == 0 && releases_result.status >= 200 && releases_result.status < 300) {
+    std::vector<ReleaseRecord> releases;
+    std::size_t release_bytes = 0;
+    std::unordered_set<std::string> visited_release_pages;
+    std::string releases_api = api + "/releases?per_page=100";
+    int release_page = 0;
+    while (!releases_api.empty()) {
+        if (++release_page > kGitHubMaxPaginationPages ||
+            !visited_release_pages.insert(releases_api).second) {
+            const std::string message =
+                "GitHub releases pagination was cyclic or exceeded the safety limit";
+            database_.update_repository_metadata_status(repo.id, "error", message);
+            return {false, metadata_output, message};
+        }
+        database_.update_job_message(
+            job.id, "Downloading public GitHub releases (page " +
+                        std::to_string(release_page) + ")");
+        auto releases_result = github_api_get(releases_api);
+        if (releases_result.interrupted) {
+            return requeue_result(metadata_output + "\n" + releases_result.body,
+                                  "Releases request interrupted by shutdown; job requeued");
+        }
+        if (is_github_rate_limited(releases_result)) {
+            const int delay = github_rate_limit_backoff_seconds(
+                releases_result, unix_time_now(), static_cast<std::uint64_t>(job.id));
+            database_.delay_pending_github_jobs(delay);
+            database_.update_repository_metadata_status(
+                repo.id, "rate-limited",
+                "GitHub API rate limit reached while listing releases; retry scheduled");
+            return requeue_result(
+                metadata_output + "\n" + releases_result.body,
+                "GitHub API rate limit reached while listing releases; retry scheduled",
+                delay);
+        }
+        if (releases_result.curl_exit_code != 0 || releases_result.status < 200 ||
+            releases_result.status >= 300) {
+            const std::string message = releases_result.response_too_large
+                ? "GitHub releases page " + std::to_string(release_page) +
+                      " exceeded the 8 MiB response limit"
+                : "GitHub releases request failed on page " +
+                      std::to_string(release_page) + " (HTTP " +
+                      std::to_string(releases_result.status) + ")";
+            database_.update_repository_metadata_status(repo.id, "error", message);
+            if (transient_github_failure(releases_result) && job.attempts < 5) {
+                return requeue_result(metadata_output + "\n" + releases_result.body,
+                                      message, transient_backoff_seconds(job));
+            }
+            return {false, metadata_output + "\n" + releases_result.body, message};
+        }
         std::string releases_error;
         auto releases_json = Json::parse(releases_result.body, releases_error);
-        if (releases_json && releases_json->is_array()) {
-            std::vector<ReleaseRecord> releases;
-            for (const auto& item : releases_json->array()) {
-                if (!item.is_object()) continue;
-                releases.push_back({
-                    json_integer(item, "id"), json_string(item, "tag_name"), json_string(item, "name"),
-                    json_string(item, "html_url"), json_string(item, "published_at"),
-                    json_boolean(item, "prerelease"), json_boolean(item, "draft")
-                });
-            }
-            database_.replace_releases(repo.id, releases);
+        if (!releases_json || !releases_json->is_array()) {
+            const std::string message =
+                "Cannot parse GitHub releases page " + std::to_string(release_page) +
+                ": " + releases_error;
+            database_.update_repository_metadata_status(repo.id, "error", message);
+            return {false, metadata_output + "\n" + releases_result.body, message};
         }
+        for (const auto& item : releases_json->array()) {
+            if (!item.is_object()) continue;
+            ReleaseRecord release{
+                json_integer(item, "id"), json_string(item, "tag_name"),
+                json_string(item, "name"), json_string(item, "html_url"),
+                json_string(item, "published_at"), json_boolean(item, "prerelease"),
+                json_boolean(item, "draft")
+            };
+            const std::size_t item_bytes = sizeof(ReleaseRecord) +
+                release.tag_name.size() + release.name.size() +
+                release.html_url.size() + release.published_at.size();
+            if (item_bytes > kGitHubMaxCollectedReleaseBytes - release_bytes) {
+                const std::string message =
+                    "GitHub releases exceed the 32 MiB in-memory import limit";
+                database_.update_repository_metadata_status(repo.id, "error", message);
+                return {false, metadata_output, message};
+            }
+            release_bytes += item_bytes;
+            releases.push_back(std::move(release));
+        }
+        if (releases_result.next_url_rejected) {
+            const std::string message =
+                "GitHub supplied an unsafe releases pagination URL";
+            database_.update_repository_metadata_status(repo.id, "error", message);
+            return {false, metadata_output, message};
+        }
+        releases_api = std::move(releases_result.next_url);
     }
-    return {true, metadata.body + "\n" + releases_result.body, {}};
+    database_.replace_releases(repo.id, releases);
+    return {true, metadata_output + "\nLoaded " + std::to_string(releases.size()) +
+                          " GitHub release(s) across " +
+                          std::to_string(release_page) + " page(s).", {}};
 }
 
 JobExecutionResult GitService::import_account(const Job& job) {
@@ -456,68 +682,88 @@ JobExecutionResult GitService::import_account(const Job& job) {
     database_.update_job_message(job.id, "Listing public repositories for GitHub account " + account);
 
     constexpr int kPerPage = 100;
-    constexpr int kMaxPages = 10; // caps a single import at 1000 repositories
-    std::vector<std::string> repo_urls;
-    bool capped = false;
-    for (int page = 1; page <= kMaxPages; ++page) {
-        const std::string api = "https://api.github.com/users/" + account + "/repos?per_page=" +
-            std::to_string(kPerPage) + "&page=" + std::to_string(page) + "&type=public&sort=full_name";
+    std::unordered_set<std::string> visited_pages;
+    std::string api = "https://api.github.com/users/" + account +
+        "/repos?per_page=" + std::to_string(kPerPage) +
+        "&type=public&sort=full_name";
+    int page = 0;
+    std::size_t found = 0;
+    std::size_t added = 0;
+    std::size_t existing = 0;
+    while (!api.empty()) {
+        if (++page > kGitHubMaxPaginationPages || !visited_pages.insert(api).second) {
+            return {false, {}, "GitHub account pagination was cyclic or exceeded the safety limit"};
+        }
+        database_.update_job_message(
+            job.id, "Listing public repositories for GitHub account " + account +
+                        " (page " + std::to_string(page) + ")");
         auto result = github_api_get(api);
         if (result.interrupted) {
             return requeue_result(std::move(result.body), "Account listing interrupted by shutdown; job requeued");
         }
         if (is_github_rate_limited(result)) {
-            database_.delay_pending_github_jobs(kGitHubRateLimitBackoffSeconds);
-            if (page == 1) {
-                // Nothing found yet — requeue the whole job rather than reporting a
-                // misleading "0 repositories found".
-                return requeue_result(std::move(result.body), "GitHub API rate limit reached; will retry automatically later",
-                                      kGitHubRateLimitBackoffSeconds);
-            }
-            break; // import what pages 1..page-1 already found; a later listing catches the rest
+            const int delay = github_rate_limit_backoff_seconds(
+                result, unix_time_now(), static_cast<std::uint64_t>(job.id));
+            database_.delay_pending_github_jobs(delay);
+            return requeue_result(
+                std::move(result.body),
+                "GitHub API rate limit reached; will retry automatically later", delay);
         }
         if (result.curl_exit_code != 0 || result.status < 200 || result.status >= 300) {
-            if (page == 1) {
-                return {false, result.body,
-                       "GitHub account lookup failed for '" + account + "' (HTTP " + std::to_string(result.status) + ")"};
+            const std::string message = result.response_too_large
+                ? "GitHub account page " + std::to_string(page) +
+                      " exceeded the 8 MiB response limit"
+                : "GitHub account lookup failed for '" + account + "' on page " +
+                      std::to_string(page) + " (HTTP " +
+                      std::to_string(result.status) + ")";
+            if (transient_github_failure(result) && job.attempts < 5) {
+                return requeue_result(std::move(result.body), message,
+                                      transient_backoff_seconds(job));
             }
-            break;
+            return {false, result.body, message};
         }
         std::string parse_error;
         auto json = Json::parse(result.body, parse_error);
         if (!json || !json->is_array()) {
-            if (page == 1) return {false, result.body, "Cannot parse GitHub account repository list: " + parse_error};
-            break;
+            return {false, result.body,
+                    "Cannot parse GitHub account repository list on page " +
+                    std::to_string(page) + ": " + parse_error};
         }
         const auto& items = json->array();
-        if (items.empty()) break;
+        std::vector<ParsedRepositoryUrl> parsed_urls;
+        parsed_urls.reserve(items.size());
         for (const auto& item : items) {
             if (!item.is_object()) continue;
             const std::string html_url = json_string(item, "html_url");
-            if (!html_url.empty()) repo_urls.push_back(html_url);
+            if (html_url.empty()) continue;
+            std::string url_error;
+            auto parsed = parse_repository_url(html_url, url_error);
+            if (parsed) {
+                parsed_urls.push_back(std::move(*parsed));
+            }
         }
-        if (items.size() < kPerPage) break;
-        if (page == kMaxPages) capped = true;
+        const auto page_results = database_.import_repositories(parsed_urls);
+        const auto page_added = static_cast<std::size_t>(
+            std::count_if(page_results.begin(), page_results.end(),
+                          [](const auto& repository) { return repository.created; }));
+        found += page_results.size();
+        added += page_added;
+        existing += page_results.size() - page_added;
+        if (result.next_url_rejected) {
+            return {false, result.body,
+                    "GitHub supplied an unsafe account pagination URL"};
+        }
+        api = std::move(result.next_url);
     }
 
-    if (repo_urls.empty()) {
+    if (found == 0) {
         return {true, {}, {}};
     }
 
-    std::vector<ParsedRepositoryUrl> parsed_urls;
-    parsed_urls.reserve(repo_urls.size());
-    for (const auto& url : repo_urls) {
-        std::string parse_error;
-        auto parsed = parse_repository_url(url, parse_error);
-        if (parsed) parsed_urls.push_back(std::move(*parsed));
-    }
-    const auto results = database_.import_repositories(parsed_urls);
-    const auto added = std::count_if(results.begin(), results.end(), [](const auto& r) { return r.created; });
-
     std::ostringstream summary;
-    summary << "Found " << repo_urls.size() << " public repositories for " << account << "; queued "
-            << added << " new clone(s), " << (results.size() - static_cast<std::size_t>(added)) << " already existed.";
-    if (capped) summary << " Only the first " << (kMaxPages * kPerPage) << " repositories were processed.";
+    summary << "Found " << found << " public repositories for " << account << "; queued "
+            << added << " new clone(s), " << existing
+            << " already existed across " << page << " API page(s).";
     return {true, summary.str(), {}};
 }
 

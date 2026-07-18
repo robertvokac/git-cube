@@ -85,6 +85,47 @@ int main() {
         require(json->get("id") && json->get("id")->integer() == 123, "JSON integer failed");
         require(json->get("items") && json->get("items")->array().size() == 2, "JSON array failed");
 
+        gitcube::GitHubApiResult github_headers;
+        github_headers.status = 403;
+        github_headers.body = R"({"message":"API rate limit exceeded"})";
+        gitcube::apply_github_response_headers(
+            "HTTP/1.1 200 Connection established\r\n"
+            "Proxy-Agent: test\r\n\r\n"
+            "HTTP/2 403\r\n"
+            "X-RateLimit-Remaining: 0\r\n"
+            "X-RateLimit-Reset: 1700000060\r\n"
+            "Retry-After: 120\r\n"
+            "Link: <https://api.github.com/resource?page=2>; rel=\"next\", "
+            "<https://api.github.com/resource?page=9>; rel=\"last\"\r\n\r\n",
+            github_headers);
+        require(github_headers.rate_limit_remaining == 0 &&
+                    github_headers.rate_limit_reset == 1700000060 &&
+                    github_headers.retry_after_seconds == 120 &&
+                    github_headers.next_url ==
+                        "https://api.github.com/resource?page=2",
+                "GitHub response headers were not parsed from the final response block");
+        require(gitcube::GitService::is_github_rate_limited(github_headers),
+                "GitHub primary rate limit was not recognized from headers");
+        require(gitcube::github_rate_limit_backoff_seconds(
+                    github_headers, 1700000000, 7) == 127,
+                "Retry-After backoff and deterministic jitter were not applied");
+        github_headers.retry_after_seconds = 0;
+        require(gitcube::github_rate_limit_backoff_seconds(
+                    github_headers, 1700000000, 7) == 72,
+                "X-RateLimit-Reset backoff was not applied");
+
+        gitcube::GitHubApiResult unsafe_next;
+        gitcube::apply_github_response_headers(
+            "HTTP/2 200\r\n"
+            "Link: <https://evil.example/resource?page=2>; rel=\"next\"\r\n\r\n",
+            unsafe_next);
+        require(unsafe_next.next_url.empty() && unsafe_next.next_url_rejected,
+                "Off-origin GitHub pagination URL must be rejected");
+        gitcube::GitHubApiResult secondary_limit;
+        secondary_limit.status = 429;
+        require(gitcube::GitService::is_github_rate_limited(secondary_limit),
+                "HTTP 429 must always trigger GitHub rate-limit backoff");
+
         const auto temp = std::filesystem::temp_directory_path() /
             ("gitcube-test-" + std::to_string(static_cast<long long>(getpid())) + "-" +
              std::to_string(static_cast<unsigned long long>(
@@ -267,6 +308,13 @@ ALTER TABLE repositories DROP COLUMN operation;
         require(recovered_health && recovered_health->id == interrupted_health->id,
                 "Recovered health job should be claimable");
         db.finish_job(recovered_health->id, true, "", "");
+        require(db.enqueue_job(added.id, "metadata"),
+                "Metadata job should enqueue for rate-limit scheduling test");
+        require(db.enqueue_job(std::nullopt, "account", "", "openeggbert"),
+                "Account job should enqueue for rate-limit scheduling test");
+        db.delay_pending_github_jobs(60);
+        require(!db.claim_next_job(),
+                "Rate-limited GitHub jobs must not be immediately claimable");
 
         const auto source_repo = temp / "source";
         auto git_result = gitcube::ProcessRunner::run(

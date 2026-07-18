@@ -212,7 +212,7 @@ void Application::cleanup_orphaned_temp_dirs() {
     for (const auto& entry : std::filesystem::directory_iterator(tmp_dir, ec)) {
         const std::string name = entry.path().filename().string();
         if ((name.starts_with("clone-") && name.ends_with(".git")) ||
-            name.starts_with("archive-")) {
+            name.starts_with("archive-") || name.starts_with("github-headers-")) {
             std::filesystem::remove_all(entry.path(), ec);
         }
     }

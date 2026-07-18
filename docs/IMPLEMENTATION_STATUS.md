@@ -23,10 +23,13 @@ pagination (25/page); 0–3 importance rating, editable per repository.
 
 **Job history UX** — pagination (50/page), filter by status.
 
-**GitHub integration** — unauthenticated public metadata + releases per repository;
-bulk account import (list every public repo under an account, up to 1000); rate-limit
-detection with automatic backoff (the triggering job and every other pending GitHub job
-reschedule ~15 minutes out instead of failing permanently).
+**GitHub integration** — unauthenticated public metadata plus fully paginated releases;
+bulk account import follows GitHub pagination links and persists one 100-item page at a
+time; rate-limit detection honors `Retry-After`/`X-RateLimit-Reset` with jitter and
+delays the triggering job plus every pending GitHub job. Transient network/5xx failures
+retry with bounded exponential backoff. API URLs stay pinned to
+`https://api.github.com/`, requests are serialized, individual responses are capped at
+8 MiB, and release accumulation has a 32 MiB budget.
 
 **Export** — branch/tag as a files-only zip (`git archive`), or the whole bare mirror as
 a zip (re-clonable, no worktree), generated into an owner-only temporary file and

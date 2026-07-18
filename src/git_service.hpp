@@ -35,10 +35,23 @@ struct JobExecutionResult {
 // status-code marker curl was asked to append already stripped off.
 struct GitHubApiResult {
     bool interrupted = false;
+    bool response_too_large = false;
     int curl_exit_code = -1;
     int status = 0;
+    std::int64_t rate_limit_remaining = -1;
+    std::int64_t rate_limit_reset = 0;
+    int retry_after_seconds = 0;
+    std::string next_url;
+    bool next_url_rejected = false;
     std::string body;
 };
+
+// Parses the final response block from curl's --dump-header output. Exposed so the
+// pagination/rate-limit protocol can be regression-tested without live API requests.
+void apply_github_response_headers(std::string_view headers, GitHubApiResult& result);
+int github_rate_limit_backoff_seconds(const GitHubApiResult& result,
+                                      std::int64_t now_epoch_seconds,
+                                      std::uint64_t jitter_seed);
 
 struct TreeEntry {
     std::string mode;
@@ -87,6 +100,7 @@ public:
 
     JobExecutionResult execute(const Job& job);
 
+    static bool is_github_rate_limited(const GitHubApiResult& result);
     bool repository_available(const Repository& repo) const;
     std::vector<TreeEntry> list_tree(const Repository& repo, const std::string& ref,
                                      const std::string& path, std::string& error) const;
@@ -114,6 +128,9 @@ private:
     Database& database_;
     const std::atomic<bool>& shutdown_requested_;
     mutable std::mutex repository_locks_mutex_;
+    // Public GitHub responses can be several MiB per page. Serializing API requests
+    // keeps the worker count from multiplying that memory footprint.
+    mutable std::mutex github_api_request_mutex_;
     mutable std::unordered_map<std::int64_t, std::shared_ptr<std::shared_mutex>>
         repository_locks_;
     mutable std::atomic<std::uint64_t> temporary_file_counter_{0};
@@ -133,7 +150,6 @@ private:
                                                      std::string prefix_output = {});
     std::string classify_git_failure(const std::string& output) const;
     GitHubApiResult github_api_get(const std::string& url) const;
-    static bool is_github_rate_limited(const GitHubApiResult& result);
 };
 
 } // namespace gitcube

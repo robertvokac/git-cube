@@ -48,7 +48,7 @@ on disk.
 - Automatic backoff when the GitHub API rate limit is hit — the affected job (and every
   other pending GitHub job) is rescheduled instead of being marked permanently failed.
 - Remote-availability and `git fsck --full --no-dangling` health checks.
-- Public GitHub repository metadata and up to 100 releases per repository, without a
+- Public GitHub repository metadata and complete paginated release history, without a
   token (unauthenticated REST API).
 - Web browsing of branches, tags, commit history, commit diffs, file trees and blobs —
   all read directly from the bare mirror, no checkout needed.
@@ -103,8 +103,9 @@ Go to **Add repository** in the header. The form takes one URL per line:
   host) queues that one repository for cloning.
 - A bare account/org URL with no repository path, e.g. `https://github.com/openeggbert`,
   queues an **account import** job: GitCube lists every public repository under that
-  account through the GitHub API (up to 1000, 100 per page) and queues a clone for each
-  one that isn't already known.
+  account through the GitHub API (100 per page, following GitHub's pagination links)
+  and queues a clone for each new one. Each page is committed before the next is loaded,
+  so memory use does not grow with the size of the account.
 - Lines for repositories GitCube already has are silently left alone — no retry, no
   side effect.
 - Up to 500 non-empty lines are processed per submission.
@@ -226,10 +227,17 @@ at 60 requests/hour per IP address by GitHub. A bulk account import queues one m
 fetch per repository, so a large account can exhaust that budget in one batch.
 
 When that happens, GitCube detects the rate-limit response specifically and reschedules
-the affected job — and every other pending GitHub-API job — about 15 minutes out, rather
-than recording a permanent failure. No action is needed; the queue drains on its own
-once the limit resets. A repository's own local mirror is never affected by a metadata
-failure — cloning, fetching and browsing work regardless.
+the affected job — and every other pending GitHub-API job — according to `Retry-After`
+or `X-RateLimit-Reset` (with a conservative fallback and small per-job jitter), rather
+than recording a permanent failure. Transient network/5xx failures use bounded
+exponential retries. No action is needed; the queue drains on its own once the limit
+resets. A repository's own local mirror is never affected by a metadata failure —
+cloning, fetching and browsing work regardless.
+
+GitHub pages are fetched one at a time and API downloads are serialized across workers.
+Each response is capped at 8 MiB; release records are accumulated under a 32 MiB budget
+before atomically replacing the previous release list. These bounds prevent a large
+account, unusually verbose releases, or a high worker count from multiplying RAM use.
 
 ### Safe shutdown
 
