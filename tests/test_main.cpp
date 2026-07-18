@@ -6,6 +6,8 @@
 #include "process.hpp"
 #include "util.hpp"
 
+#include <sqlite3.h>
+
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -18,6 +20,24 @@
 namespace {
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void execute_sql(const std::filesystem::path& path, const char* sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
+        const std::string message = db ? sqlite3_errmsg(db) : "cannot allocate handle";
+        if (db) sqlite3_close(db);
+        throw std::runtime_error("Cannot prepare migration fixture: " + message);
+    }
+    char* sqlite_error = nullptr;
+    const int result = sqlite3_exec(db, sql, nullptr, nullptr, &sqlite_error);
+    const std::string message =
+        sqlite_error ? sqlite_error : (result == SQLITE_OK ? "" : sqlite3_errmsg(db));
+    sqlite3_free(sqlite_error);
+    sqlite3_close(db);
+    if (result != SQLITE_OK) {
+        throw std::runtime_error("Cannot prepare migration fixture: " + message);
+    }
 }
 }
 
@@ -85,6 +105,34 @@ int main() {
             gitcube::DataDirectoryLock lock_after_release(temp);
         }
 
+        const auto migration_path = temp / "migration-v4.sqlite3";
+        {
+            gitcube::Database fixture(migration_path);
+            fixture.initialize();
+            const auto fixture_repo = fixture.add_repository(*github);
+            fixture.update_repository_status(fixture_repo.id, "unhealthy",
+                                             "old fsck failure");
+        }
+        execute_sql(migration_path, R"SQL(
+DELETE FROM schema_migrations WHERE version=5;
+ALTER TABLE repositories DROP COLUMN metadata_error;
+ALTER TABLE repositories DROP COLUMN metadata_status;
+ALTER TABLE repositories DROP COLUMN health_error;
+ALTER TABLE repositories DROP COLUMN health_status;
+ALTER TABLE repositories DROP COLUMN operation;
+)SQL");
+        {
+            gitcube::Database migrated(migration_path);
+            migrated.initialize();
+            const auto migrated_repo = migrated.get_repository(1);
+            require(migrated_repo && migrated_repo->status == "ready" &&
+                        migrated_repo->operation.empty() &&
+                        migrated_repo->health_status == "unhealthy" &&
+                        migrated_repo->health_error == "old fsck failure" &&
+                        migrated_repo->metadata_status == "unknown",
+                    "Schema v4 repository state did not migrate cleanly to v5");
+        }
+
         const auto printed = gitcube::ProcessRunner::run({"/usr/bin/printf", "hello"});
         require(printed.exit_code == 0 && printed.output == "hello",
                 "Process stdout capture failed");
@@ -147,11 +195,78 @@ int main() {
         db.initialize();
         const auto added = db.add_repository(*github);
         require(added.created, "Repository should be inserted");
+        auto repository_state = db.get_repository(added.id);
+        require(repository_state.has_value() && repository_state->status == "queued" &&
+                    repository_state->operation.empty() &&
+                    repository_state->health_status == "unknown" &&
+                    repository_state->metadata_status == "unknown",
+                "Repository state channels have incorrect defaults");
         require(db.enqueue_job(added.id, "clone"), "Clone job should enqueue");
         require(!db.enqueue_job(added.id, "clone"), "Duplicate active job should be rejected");
         const auto job = db.claim_next_job();
         require(job.has_value() && job->type == "clone", "Clone job should be claimed");
+        db.set_repository_operation(added.id, "cloning");
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->operation == "cloning",
+                "Claimed repository operation was not stored");
         db.finish_job(job->id, true, "ok", "");
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->operation.empty(),
+                "Finishing a job must atomically clear its repository operation");
+
+        db.update_repository_status(added.id, "ready");
+        db.update_repository_health(added.id, "unhealthy", "fsck failed");
+        db.update_repository_metadata_status(added.id, "error", "API failed");
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->status == "ready" &&
+                    repository_state->health_status == "unhealthy" &&
+                    repository_state->health_error == "fsck failed" &&
+                    repository_state->metadata_status == "error" &&
+                    repository_state->metadata_error == "API failed",
+                "Health or metadata update overwrote another repository state channel");
+        gitcube::RepositoryFilter unhealthy_filter;
+        unhealthy_filter.status = "unhealthy";
+        require(db.list_repositories_page(unhealthy_filter, 1, 25).total == 1,
+                "Repository filtering must include health state");
+        gitcube::RepositoryFilter metadata_error_filter;
+        metadata_error_filter.status = "error";
+        require(db.list_repositories_page(metadata_error_filter, 1, 25).total == 1,
+                "Repository filtering must include metadata state");
+
+        db.update_repository_health(added.id, "healthy", "");
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->health_error.empty() &&
+                    repository_state->metadata_error == "API failed",
+                "A successful health check must not clear a metadata error");
+
+        require(db.enqueue_job(added.id, "fetch"), "Fetch job should enqueue");
+        const auto fetch_job = db.claim_next_job();
+        require(fetch_job && fetch_job->type == "fetch", "Fetch job should be claimed");
+        db.set_repository_operation(added.id, "fetching");
+        db.requeue_job(fetch_job->id, "retry");
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->operation.empty() &&
+                    db.queued_job_count() == 1,
+                "Requeueing a job must atomically clear its repository operation");
+        const auto retried_fetch = db.claim_next_job();
+        require(retried_fetch && retried_fetch->id == fetch_job->id,
+                "Requeued fetch job should be claimable again");
+        db.finish_job(retried_fetch->id, true, "", "");
+
+        require(db.enqueue_job(added.id, "health"), "Health job should enqueue");
+        const auto interrupted_health = db.claim_next_job();
+        require(interrupted_health && interrupted_health->type == "health",
+                "Health job should be claimed");
+        db.set_repository_operation(added.id, "checking");
+        db.recover_interrupted_jobs();
+        repository_state = db.get_repository(added.id);
+        require(repository_state && repository_state->operation.empty() &&
+                    db.active_job_count() == 0 && db.queued_job_count() == 1,
+                "Startup recovery must requeue running work and clear stale operations");
+        const auto recovered_health = db.claim_next_job();
+        require(recovered_health && recovered_health->id == interrupted_health->id,
+                "Recovered health job should be claimable");
+        db.finish_job(recovered_health->id, true, "", "");
 
         const auto source_repo = temp / "source";
         auto git_result = gitcube::ProcessRunner::run(

@@ -19,6 +19,11 @@ struct Repository {
     std::string name;
     std::string storage_relpath;
     std::string status;
+    std::string operation;
+    std::string health_status;
+    std::string health_error;
+    std::string metadata_status;
+    std::string metadata_error;
     bool paused = false;
     bool github = false;
     std::string default_branch;
@@ -129,13 +134,17 @@ public:
 
     bool set_repository_paused(std::int64_t id, bool paused);
     bool set_repository_importance(std::int64_t id, int importance);
+    void set_repository_operation(std::int64_t id, const std::string& operation);
     void update_repository_status(std::int64_t id, const std::string& status,
                                   const std::string& error = {});
     void sync_repository_refs_and_stats(std::int64_t id, const std::vector<RefRecord>& refs,
                                         const std::string& default_branch, const std::string& head_oid,
                                         std::int64_t branches, std::int64_t tags, std::int64_t objects,
                                         bool fetched);
-    void update_repository_health(std::int64_t id, bool healthy, const std::string& error);
+    void update_repository_health(std::int64_t id, const std::string& health_status,
+                                  const std::string& error);
+    void update_repository_metadata_status(std::int64_t id, const std::string& metadata_status,
+                                           const std::string& error = {});
     void update_github_metadata(std::int64_t id, std::int64_t github_id,
                                 const std::string& default_branch, const std::string& description,
                                 const std::string& homepage, const std::string& html_url,

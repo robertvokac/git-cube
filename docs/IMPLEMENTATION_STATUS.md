@@ -3,7 +3,7 @@
 This is a running log of what has shipped and how it was verified, kept for anyone
 tracking the project's progress or picking up development. It intentionally does not
 explain how to use a feature or what GitCube's user-facing limitations are — that's
-[`README.md`](../README.md). Current database schema version: **4** (see
+[`README.md`](../README.md). Current database schema version: **5** (see
 `kMigrations[]` in `src/database.cpp`).
 
 ## Shipped, by area
@@ -38,6 +38,12 @@ database (fresh or old) after a frozen v1 `CREATE TABLE` snapshot, plus a
 `verify_schema()` startup check that fails loudly and specifically if a load-bearing
 column is missing.
 
+**Independent repository states** — local availability, the currently running
+operation, health-check outcome, and GitHub-metadata outcome have separate persistent
+fields and error messages. Job completion/requeue and startup recovery atomically clear
+stale operation markers, while an unexpected worker exception requeues with backoff
+and eventually fails after three attempts instead of leaving a job permanently running.
+
 **Security hardening pass** (found via review, fixed and verified in the same session):
 SVG/HTML/XML raw-blob content-type XSS, a job-queue race allowing duplicate concurrent
 jobs, per-repo job mutual exclusion, interrupted/paused jobs being recorded as permanent
@@ -66,8 +72,9 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
 - The GitHub API rate-limit backoff was exercised against the **real, actually
   exhausted** rate limit (not simulated) and confirmed to reschedule rather than fail.
 - Migration convergence tested three ways: a brand-new database, a hand-built
-  pre-migration (v1) database, and a database already at v3 — all reach v4 cleanly with
-  no data loss.
+  pre-migration (v1) database, and a database already at v3 — all reach the then-current
+  v4 cleanly with no data loss. Fresh-database schema v5 and its independent state
+  behavior are covered by the automated test suite.
 - `verify_schema()` confirmed to actually fire: a hand-built database with a
   `schema_migrations` row falsely claiming v4 while missing the v4 column fails loudly
   at startup with a specific error, instead of a cryptic later query failure.

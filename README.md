@@ -121,8 +121,10 @@ both here and everywhere else a URL is accepted.
 The home page (**Repositories**) lists every known repository, 25 per page, with:
 
 - **Search** — substring match against owner, name, host or description.
-- **Status** — exact match (`queued`, `cloning`, `fetching`, `checking`, `metadata`,
-  `ready`, `missing`, `unhealthy`, `error`).
+- **State** — exact match across independent availability, current-operation, health,
+  and GitHub-metadata states (`queued`, `cloning`, `fetching`, `checking`, `metadata`,
+  `ready`, `missing`, `healthy`, `unhealthy`, `remote-missing`, `rate-limited`,
+  `error`).
 - **Account** — GitHub owner/org (substring; only matches GitHub repositories).
 - **Tag** — matches a git tag name actually present on the repository (from the `refs`
   table, refreshed on every clone/fetch).
@@ -130,6 +132,12 @@ The home page (**Repositories**) lists every known repository, 25 per page, with
 
 Every open dashboard tab polls `/api/status` every two seconds to keep status badges and
 the active/queued job counters live, without a full page reload.
+
+Repository state is deliberately split into independent channels. A failed metadata
+refresh or remote health check cannot make an otherwise valid local mirror stop being
+`ready`; the detail page reports availability, health, and metadata state (and their
+errors) separately. The dashboard badge prioritizes a running operation, then a local
+availability problem, then an unhealthy/unreachable remote.
 
 **Importance** is a simple 0–3 priority you can set yourself (GitCube never sets it):
 
@@ -337,6 +345,7 @@ const Migration kMigrations[] = {
     {2, R"SQL( ... )SQL"},   // rebuilds jobs: adds payload column, widens type CHECK
     {3, "ALTER TABLE jobs ADD COLUMN scheduled_at TEXT NOT NULL DEFAULT '';"},
     {4, "ALTER TABLE repositories ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;"},
+    {5, R"SQL( ... )SQL"},   // separates availability, operation, health and metadata state
 };
 ```
 

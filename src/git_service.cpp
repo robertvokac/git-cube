@@ -190,7 +190,7 @@ JobExecutionResult GitService::execute(const Job& job) {
 }
 
 JobExecutionResult GitService::clone_repository(const Job& job, const Repository& repo) {
-    database_.update_repository_status(repo.id, "cloning");
+    database_.set_repository_operation(repo.id, "cloning");
     database_.update_job_message(job.id, "Creating mirror repository");
 
     const auto target = repo_path(repo);
@@ -243,10 +243,11 @@ JobExecutionResult GitService::clone_repository(const Job& job, const Repository
 
 JobExecutionResult GitService::fetch_repository(const Job& job, const Repository& repo) {
     if (!repository_available(repo)) {
-        database_.update_repository_status(repo.id, "error", "Mirror repository is missing locally");
+        database_.update_repository_status(repo.id, "missing",
+                                           "Mirror repository is missing locally");
         return {false, {}, "Mirror repository is missing locally; enqueue clone again"};
     }
-    database_.update_repository_status(repo.id, "fetching");
+    database_.set_repository_operation(repo.id, "fetching");
     database_.update_job_message(job.id, "Fetching all refs, pruning deleted refs and refreshing tags");
     auto result = ProcessRunner::run(
         git_args(repo, {"fetch", "--all", "--prune", "--prune-tags", "--force", "--tags", "--progress"}), {},
@@ -257,8 +258,9 @@ JobExecutionResult GitService::fetch_repository(const Job& job, const Repository
     }
     if (result.exit_code != 0) {
         const std::string output = process_output(std::move(result));
-        const std::string status = classify_git_failure(output);
-        database_.update_repository_status(repo.id, status, trim(output));
+        // A failed remote update does not make an existing local mirror unavailable.
+        // Keep it browsable/exportable and record the synchronization error separately.
+        database_.update_repository_status(repo.id, "ready", trim(output));
         return {false, output, trim(output).empty() ? "git fetch failed" : trim(output)};
     }
     return synchronize_repository_state(repo, true, process_output(std::move(result)));
@@ -324,7 +326,7 @@ JobExecutionResult GitService::synchronize_repository_state(const Repository& re
 }
 
 JobExecutionResult GitService::health_repository(const Job& job, const Repository& repo) {
-    database_.update_repository_status(repo.id, "checking");
+    database_.set_repository_operation(repo.id, "checking");
     database_.update_job_message(job.id, "Checking remote availability and local object integrity");
 
     auto remote = ProcessRunner::run({"git", "-c", "credential.helper=", "-c",
@@ -337,11 +339,15 @@ JobExecutionResult GitService::health_repository(const Job& job, const Repositor
     if (remote.exit_code != 0) {
         const std::string output = process_output(std::move(remote));
         const std::string status = classify_git_failure(output);
-        database_.update_repository_status(repo.id, status, trim(output));
+        database_.update_repository_health(
+            repo.id, status == "missing" ? "remote-missing" : "error", trim(output));
         return {false, output, "Remote repository check failed"};
     }
     if (!repository_available(repo)) {
-        database_.update_repository_status(repo.id, "error", "Local mirror is missing or invalid");
+        database_.update_repository_status(repo.id, "missing",
+                                           "Local mirror is missing or invalid");
+        database_.update_repository_health(repo.id, "error",
+                                           "Local mirror is missing or invalid");
         return {false, process_output(std::move(remote)),
                 "Local mirror is missing or invalid"};
     }
@@ -356,7 +362,7 @@ JobExecutionResult GitService::health_repository(const Job& job, const Repositor
     const bool healthy = fsck.exit_code == 0;
     const std::string fsck_output = process_output(std::move(fsck));
     const std::string remote_output = process_output(std::move(remote));
-    database_.update_repository_health(repo.id, healthy,
+    database_.update_repository_health(repo.id, healthy ? "healthy" : "unhealthy",
                                        healthy ? std::string{} : trim(fsck_output));
     return {healthy, remote_output + fsck_output,
             healthy ? std::string{} : "git fsck reported errors"};
@@ -364,7 +370,7 @@ JobExecutionResult GitService::health_repository(const Job& job, const Repositor
 
 JobExecutionResult GitService::metadata_repository(const Job& job, const Repository& repo) {
     if (!repo.github) return {false, {}, "Metadata API is currently implemented only for GitHub"};
-    database_.update_repository_status(repo.id, "metadata");
+    database_.set_repository_operation(repo.id, "metadata");
     database_.update_job_message(job.id, "Downloading public GitHub repository metadata");
 
     const std::string api = "https://api.github.com/repos/" + repo.owner + "/" + repo.name;
@@ -374,11 +380,15 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
     }
     if (is_github_rate_limited(metadata)) {
         database_.delay_pending_github_jobs(kGitHubRateLimitBackoffSeconds);
+        database_.update_repository_metadata_status(
+            repo.id, "rate-limited",
+            "GitHub API rate limit reached; will retry automatically later");
         return requeue_result(std::move(metadata.body), "GitHub API rate limit reached; will retry automatically later",
                               kGitHubRateLimitBackoffSeconds);
     }
     if (metadata.curl_exit_code != 0 || metadata.status < 200 || metadata.status >= 300) {
-        database_.update_repository_status(repo.id, "ready", trim(metadata.body));
+        database_.update_repository_metadata_status(repo.id, "error",
+                                                    trim(metadata.body));
         return {false, metadata.body,
                "GitHub metadata request failed (HTTP " + std::to_string(metadata.status) + ")"};
     }
@@ -386,7 +396,7 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
     std::string parse_error;
     auto json = Json::parse(metadata.body, parse_error);
     if (!json || !json->is_object()) {
-        database_.update_repository_status(repo.id, "ready", parse_error);
+        database_.update_repository_metadata_status(repo.id, "error", parse_error);
         return {false, metadata.body, "Cannot parse GitHub metadata: " + parse_error};
     }
 
@@ -418,7 +428,6 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
         // The repository's own metadata already saved successfully above; only the
         // releases list is missing. Leave the repo "ready" and let the next scheduled
         // metadata refresh pick up releases rather than requeuing the whole job.
-        database_.update_repository_status(repo.id, "ready");
         return {true, metadata.body + "\n" + releases_result.body,
                "GitHub API rate limit reached while listing releases; will retry on the next metadata refresh"};
     }
@@ -438,7 +447,6 @@ JobExecutionResult GitService::metadata_repository(const Job& job, const Reposit
             database_.replace_releases(repo.id, releases);
         }
     }
-    database_.update_repository_status(repo.id, "ready");
     return {true, metadata.body + "\n" + releases_result.body, {}};
 }
 

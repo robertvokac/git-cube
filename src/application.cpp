@@ -107,6 +107,23 @@ std::string importance_stars_html(int importance) {
     return out.str();
 }
 
+std::string display_status(const Repository& repository) {
+    if (!repository.operation.empty()) return repository.operation;
+    if (repository.status != "ready") return repository.status;
+    if (repository.health_status == "unhealthy" ||
+        repository.health_status == "remote-missing" ||
+        repository.health_status == "error") {
+        return repository.health_status;
+    }
+    return repository.status;
+}
+
+std::string display_error(const Repository& repository) {
+    if (!repository.last_error.empty()) return repository.last_error;
+    if (!repository.health_error.empty()) return repository.health_error;
+    return repository.metadata_error;
+}
+
 } // namespace
 
 Application::Application(Config config, std::atomic<bool>& shutdown_requested)
@@ -203,24 +220,45 @@ void Application::cleanup_orphaned_temp_dirs() {
 
 void Application::worker_loop(int worker_number) {
     while (!shutdown_requested_.load(std::memory_order_relaxed)) {
+        std::optional<Job> claimed_job;
         try {
-            auto job = database_.claim_next_job();
-            if (!job) {
+            claimed_job = database_.claim_next_job();
+            if (!claimed_job) {
                 std::unique_lock lock(work_mutex_);
                 work_cv_.wait_for(lock, std::chrono::milliseconds(500), [this] {
                     return shutdown_requested_.load(std::memory_order_relaxed);
                 });
                 continue;
             }
-            database_.update_job_message(job->id, "Worker " + std::to_string(worker_number) + " started " + job->type);
-            auto result = git_.execute(*job);
+            database_.update_job_message(
+                claimed_job->id, "Worker " + std::to_string(worker_number) +
+                                     " started " + claimed_job->type);
+            auto result = git_.execute(*claimed_job);
             if (result.requeue) {
-                database_.requeue_job(job->id, result.error, result.requeue_delay_seconds);
+                database_.requeue_job(claimed_job->id, result.error,
+                                      result.requeue_delay_seconds);
             } else {
-                database_.finish_job(job->id, result.success, result.output, result.error);
+                database_.finish_job(claimed_job->id, result.success, result.output,
+                                     result.error);
             }
+            claimed_job.reset();
         } catch (const std::exception& e) {
             std::cerr << "Worker " << worker_number << " error: " << e.what() << "\n";
+            if (claimed_job) {
+                try {
+                    const std::string message =
+                        "Unexpected worker error: " + std::string(e.what());
+                    if (claimed_job->attempts >= 3) {
+                        database_.finish_job(claimed_job->id, false, {}, message);
+                    } else {
+                        database_.requeue_job(claimed_job->id, message, 5);
+                    }
+                } catch (const std::exception& recovery_error) {
+                    std::cerr << "Worker " << worker_number
+                              << " could not recover job #" << claimed_job->id << ": "
+                              << recovery_error.what() << "\n";
+                }
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
     }
@@ -350,7 +388,9 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
          << html_escape(filter.search) << "\" placeholder=\"owner, name, host, description\"></div>"
          << "<div class=\"field\"><label for=\"f-status\">Status</label><select id=\"f-status\" name=\"status\">"
          << "<option value=\"\">Any</option>";
-    for (const char* status : {"queued", "cloning", "fetching", "checking", "metadata", "ready", "missing", "unhealthy", "error"}) {
+    for (const char* status : {"queued", "cloning", "fetching", "checking", "metadata",
+                               "ready", "missing", "healthy", "unhealthy",
+                               "remote-missing", "rate-limited", "error"}) {
         body << "<option value=\"" << status << "\"" << (filter.status == status ? " selected" : "") << ">"
              << html_escape(status_label(status)) << "</option>";
     }
@@ -378,14 +418,16 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     } else {
         body << "<table><thead><tr><th>Repository</th><th>Account</th><th>Importance</th><th>Status</th><th>Refs</th><th>Last success</th><th>Metadata</th></tr></thead><tbody>";
         for (const auto& repo : listing.items) {
+            const std::string shown_status = display_status(repo);
+            const std::string shown_error = display_error(repo);
             body << "<tr><td><a class=\"repo-name\" href=\"/repo/" << repo.id << "\">" << html_escape(repo.owner + "/" + repo.name)
                  << "</a><br><span class=\"muted\">" << html_escape(repo.host) << "</span>";
             if (!repo.description.empty()) body << "<div class=\"description muted\">" << html_escape(clip(repo.description, 180)) << "</div>";
             body << "</td><td>" << (repo.github ? html_escape(repo.owner) : "") << "</td>";
             body << "<td>" << importance_stars_html(repo.importance) << "</td>";
-            body << "<td><span data-repo-status=\"" << repo.id << "\" class=\"badge " << status_css(repo.status) << "\">"
-                 << html_escape(status_label(repo.status)) << (repo.paused ? " · paused" : "") << "</span>";
-            if (!repo.last_error.empty()) body << "<br><span class=\"muted\">" << html_escape(clip(repo.last_error, 140)) << "</span>";
+            body << "<td><span data-repo-status=\"" << repo.id << "\" class=\"badge " << status_css(shown_status) << "\">"
+                 << html_escape(status_label(shown_status)) << (repo.paused ? " · paused" : "") << "</span>";
+            if (!shown_error.empty()) body << "<br><span class=\"muted\">" << html_escape(clip(shown_error, 140)) << "</span>";
             body << "</td><td>" << repo.branch_count << " branches<br>" << repo.tag_count << " tags</td><td class=\"nowrap\">"
                  << html_escape(repo.last_success_at.empty() ? "—" : repo.last_success_at) << "</td><td>";
             if (repo.github) body << repo.stars << " ★ · " << repo.forks << " forks";
@@ -524,13 +566,14 @@ HttpResponse Application::repository_page(std::int64_t id) {
     const auto tags = database_.list_refs(id, "tag");
     const auto releases = database_.list_releases(id);
     const std::string ref = !repo->default_branch.empty() ? repo->default_branch : "HEAD";
+    const std::string shown_status = display_status(*repo);
     std::string commits_error;
     const auto commits = git_.list_commits(*repo, ref, 20, commits_error);
 
     std::ostringstream body;
     body << "<section><div class=\"repo-header\"><div><h1>" << html_escape(repo->owner + "/" + repo->name) << "</h1><p class=\"muted\">"
-         << html_escape(repo->normalized_url) << "</p><span class=\"badge " << status_css(repo->status) << "\">"
-         << html_escape(status_label(repo->status)) << (repo->paused ? " · paused" : "") << "</span></div><div class=\"actions\">";
+         << html_escape(repo->normalized_url) << "</p><span class=\"badge " << status_css(shown_status) << "\">"
+         << html_escape(status_label(shown_status)) << (repo->paused ? " · paused" : "") << "</span></div><div class=\"actions\">";
     if (repo->paused) body << action_form("/repo/" + std::to_string(id) + "/resume", "Resume", "secondary");
     else body << action_form("/repo/" + std::to_string(id) + "/pause", "Pause", "secondary");
     body << action_form("/repo/" + std::to_string(id) + "/fetch", "Fetch")
@@ -568,12 +611,25 @@ HttpResponse Application::repository_page(std::int64_t id) {
          << html_escape(repo->default_branch.empty() ? "unknown" : repo->default_branch) << "</td></tr><tr><th>HEAD</th><td class=\"path\">"
          << html_escape(repo->head_oid) << "</td></tr><tr><th>Objects</th><td>" << repo->object_count << "</td></tr><tr><th>Last fetch</th><td>"
          << html_escape(repo->last_fetch_at.empty() ? "—" : repo->last_fetch_at) << "</td></tr><tr><th>Last health check</th><td>"
-         << html_escape(repo->last_health_at.empty() ? "—" : repo->last_health_at) << "</td></tr>";
+         << html_escape(repo->last_health_at.empty() ? "—" : repo->last_health_at)
+         << "</td></tr><tr><th>Health state</th><td>"
+         << html_escape(status_label(repo->health_status));
+    if (!repo->health_error.empty()) {
+        body << "<br><span class=\"muted\">" << html_escape(repo->health_error) << "</span>";
+    }
+    body << "</td></tr>";
     if (repo->github) {
         body << "<tr><th>GitHub</th><td>" << repo->stars << " stars · " << repo->forks << " forks · " << repo->open_issues << " open issues"
              << (repo->archived ? " · archived" : "") << (repo->fork ? " · fork" : "") << "</td></tr><tr><th>License</th><td>"
              << html_escape(repo->license.empty() ? "unknown" : repo->license) << "</td></tr><tr><th>Metadata fetched</th><td>"
-             << html_escape(repo->metadata_fetched_at.empty() ? "—" : repo->metadata_fetched_at) << "</td></tr>";
+             << html_escape(repo->metadata_fetched_at.empty() ? "—" : repo->metadata_fetched_at)
+             << "</td></tr><tr><th>Metadata state</th><td>"
+             << html_escape(status_label(repo->metadata_status));
+        if (!repo->metadata_error.empty()) {
+            body << "<br><span class=\"muted\">" << html_escape(repo->metadata_error)
+                 << "</span>";
+        }
+        body << "</td></tr>";
     }
     body << "</tbody></table></section>";
 
@@ -787,8 +843,9 @@ HttpResponse Application::api_status() {
     for (const auto& repo : repos) {
         if (!first) json << ',';
         first = false;
-        json << "{\"id\":" << repo.id << ",\"status\":\"" << json_escape(repo.status) << "\",\"label\":\""
-             << json_escape(status_label(repo.status)) << "\",\"css\":\"" << json_escape(status_css(repo.status))
+        const std::string shown_status = display_status(repo);
+        json << "{\"id\":" << repo.id << ",\"status\":\"" << json_escape(shown_status) << "\",\"label\":\""
+             << json_escape(status_label(shown_status)) << "\",\"css\":\"" << json_escape(status_css(shown_status))
              << "\",\"paused\":" << (repo.paused ? "true" : "false") << "}";
     }
     json << "]}";
@@ -810,7 +867,7 @@ HttpResponse Application::check_repo_api(const HttpRequest& request) {
         return HttpResponse::json(json.str());
     }
     json << "{\"ok\":true,\"exists\":true,\"id\":" << existing->id << ",\"status\":\""
-         << json_escape(status_label(existing->status)) << "\",\"name\":\""
+         << json_escape(status_label(display_status(*existing))) << "\",\"name\":\""
          << json_escape(existing->owner + "/" + existing->name) << "\"}";
     return HttpResponse::json(json.str());
 }

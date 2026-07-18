@@ -53,6 +53,30 @@ CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
 )SQL"},
     {3, "ALTER TABLE jobs ADD COLUMN scheduled_at TEXT NOT NULL DEFAULT '';"},
     {4, "ALTER TABLE repositories ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;"},
+    {5, R"SQL(
+ALTER TABLE repositories ADD COLUMN operation TEXT NOT NULL DEFAULT '';
+ALTER TABLE repositories ADD COLUMN health_status TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE repositories ADD COLUMN health_error TEXT NOT NULL DEFAULT '';
+ALTER TABLE repositories ADD COLUMN metadata_status TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE repositories ADD COLUMN metadata_error TEXT NOT NULL DEFAULT '';
+UPDATE repositories SET
+ operation = CASE status
+   WHEN 'cloning' THEN 'cloning'
+   WHEN 'fetching' THEN 'fetching'
+   WHEN 'checking' THEN 'checking'
+   WHEN 'metadata' THEN 'metadata'
+   ELSE ''
+ END,
+ health_status = CASE status WHEN 'unhealthy' THEN 'unhealthy' ELSE 'unknown' END,
+ health_error = CASE status WHEN 'unhealthy' THEN last_error ELSE '' END,
+ metadata_status = CASE WHEN metadata_fetched_at <> '' THEN 'ready' ELSE 'unknown' END,
+ status = CASE
+   WHEN status IN ('cloning','fetching','checking','metadata')
+     THEN CASE WHEN last_success_at <> '' THEN 'ready' ELSE 'queued' END
+   WHEN status = 'unhealthy' THEN 'ready'
+   ELSE status
+ END;
+)SQL"},
 };
 
 
@@ -192,7 +216,10 @@ void verify_schema(Connection& db) {
             }
         }
     };
-    require_columns("repositories", {"id", "storage_relpath", "importance", "branch_count", "tag_count", "object_count"});
+    require_columns("repositories", {"id", "storage_relpath", "importance", "operation",
+                                      "health_status", "health_error", "metadata_status",
+                                      "metadata_error", "branch_count", "tag_count",
+                                      "object_count"});
     require_columns("jobs", {"id", "repo_id", "type", "status", "payload", "scheduled_at", "attempts"});
 }
 
@@ -207,6 +234,11 @@ Repository read_repository(Statement& stmt) {
     r.name = stmt.text(c++);
     r.storage_relpath = stmt.text(c++);
     r.status = stmt.text(c++);
+    r.operation = stmt.text(c++);
+    r.health_status = stmt.text(c++);
+    r.health_error = stmt.text(c++);
+    r.metadata_status = stmt.text(c++);
+    r.metadata_error = stmt.text(c++);
     r.paused = stmt.int_value(c++) != 0;
     r.github = stmt.int_value(c++) != 0;
     r.default_branch = stmt.text(c++);
@@ -238,6 +270,7 @@ Repository read_repository(Statement& stmt) {
 
 const char* repository_columns = R"SQL(
  id, original_url, normalized_url, host, owner, name, storage_relpath, status,
+ operation, health_status, health_error, metadata_status, metadata_error,
  paused, is_github, default_branch, description, homepage, html_url, license,
  archived, is_fork, stars, forks, open_issues, github_repo_id, created_at,
  updated_at, pushed_at, metadata_fetched_at, last_fetch_at, last_success_at,
@@ -399,7 +432,7 @@ void Database::recover_interrupted_jobs() {
     db.exec("BEGIN IMMEDIATE;");
     try {
         db.exec("UPDATE jobs SET status='queued', started_at='', finished_at='', error='Recovered after GitCube shutdown', message='Recovered interrupted job' WHERE status='running';");
-        db.exec("UPDATE repositories SET status='queued', modified_at=datetime('now') WHERE status IN ('cloning','fetching','checking','metadata');");
+        db.exec("UPDATE repositories SET operation='', modified_at=datetime('now') WHERE operation<>'';");
         db.exec("COMMIT;");
     } catch (...) {
         db.exec("ROLLBACK;");
@@ -493,7 +526,8 @@ namespace {
 constexpr const char* kRepositoryFilterWhere = R"SQL(
 WHERE (?1 = '' OR owner LIKE '%'||?1||'%' ESCAPE '\' OR name LIKE '%'||?1||'%' ESCAPE '\'
        OR host LIKE '%'||?1||'%' ESCAPE '\' OR description LIKE '%'||?1||'%' ESCAPE '\')
-  AND (?2 = '' OR status = ?2)
+  AND (?2 = '' OR status = ?2 OR operation = ?2 OR health_status = ?2
+       OR metadata_status = ?2)
   AND (?3 = '' OR (is_github = 1 AND owner LIKE '%'||?3||'%' ESCAPE '\'))
   AND (?4 = '' OR EXISTS (
         SELECT 1 FROM refs WHERE refs.repo_id = repositories.id AND refs.type = 'tag'
@@ -579,6 +613,15 @@ void Database::update_repository_status(std::int64_t id, const std::string& stat
     stmt.step_done();
 }
 
+void Database::set_repository_operation(std::int64_t id, const std::string& operation) {
+    Connection db(path_);
+    Statement stmt(db.get(), "UPDATE repositories SET operation=?, modified_at=? WHERE id=?");
+    stmt.bind(1, operation);
+    stmt.bind(2, now_utc());
+    stmt.bind(3, id);
+    stmt.step_done();
+}
+
 void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector<RefRecord>& refs,
                                               const std::string& default_branch, const std::string& head_oid,
                                               std::int64_t branches, std::int64_t tags, std::int64_t objects,
@@ -624,15 +667,28 @@ void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector
     }
 }
 
-void Database::update_repository_health(std::int64_t id, bool healthy, const std::string& error) {
+void Database::update_repository_health(std::int64_t id, const std::string& health_status,
+                                        const std::string& error) {
     Connection db(path_);
-    Statement stmt(db.get(), "UPDATE repositories SET status=?, last_health_at=?, last_error=?, modified_at=? WHERE id=?");
-    stmt.bind(1, healthy ? "ready" : "unhealthy");
+    Statement stmt(db.get(), "UPDATE repositories SET health_status=?, last_health_at=?, health_error=?, modified_at=? WHERE id=?");
+    stmt.bind(1, health_status);
     const auto now = now_utc();
     stmt.bind(2, now);
     stmt.bind(3, error);
     stmt.bind(4, now);
     stmt.bind(5, id);
+    stmt.step_done();
+}
+
+void Database::update_repository_metadata_status(std::int64_t id,
+                                                 const std::string& metadata_status,
+                                                 const std::string& error) {
+    Connection db(path_);
+    Statement stmt(db.get(), "UPDATE repositories SET metadata_status=?, metadata_error=?, modified_at=? WHERE id=?");
+    stmt.bind(1, metadata_status);
+    stmt.bind(2, error);
+    stmt.bind(3, now_utc());
+    stmt.bind(4, id);
     stmt.step_done();
 }
 
@@ -649,7 +705,7 @@ void Database::update_github_metadata(std::int64_t id, std::int64_t github_id,
 UPDATE repositories SET github_repo_id=?, default_branch=CASE WHEN ?='' THEN default_branch ELSE ? END,
  description=?, homepage=?, html_url=?, license=?, archived=?, is_fork=?, stars=?, forks=?,
  open_issues=?, created_at=?, updated_at=?, pushed_at=?, metadata_fetched_at=?,
- github_metadata_json=?, modified_at=? WHERE id=?
+ github_metadata_json=?, metadata_status='ready', metadata_error='', modified_at=? WHERE id=?
 )SQL");
     stmt.bind(1, github_id);
     stmt.bind(2, default_branch);
@@ -696,7 +752,7 @@ std::size_t Database::enqueue_all(const std::string& type) {
     try {
         for (const auto& repo : repositories) {
             if (repo.paused) continue;
-            if (type == "fetch" && repo.status != "ready" && repo.status != "unhealthy" && repo.status != "error" && repo.status != "missing") continue;
+            if (type == "fetch" && repo.last_success_at.empty()) continue;
             if (type != "clone" && repo.status == "queued") continue;
             if (enqueue_job_locked(db.get(), repo.id, type, {}, {})) ++count;
         }
@@ -747,13 +803,26 @@ ORDER BY j.id LIMIT 1
 
 void Database::finish_job(std::int64_t job_id, bool success, const std::string& output, const std::string& error) {
     Connection db(path_);
-    Statement stmt(db.get(), "UPDATE jobs SET status=?,finished_at=?,output=?,error=? WHERE id=?");
-    stmt.bind(1, success ? "success" : "failed");
-    stmt.bind(2, now_utc());
-    stmt.bind(3, output.substr(0, 1024 * 1024));
-    stmt.bind(4, error.substr(0, 65536));
-    stmt.bind(5, job_id);
-    stmt.step_done();
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        Statement stmt(db.get(), "UPDATE jobs SET status=?,finished_at=?,output=?,error=? WHERE id=?");
+        stmt.bind(1, success ? "success" : "failed");
+        stmt.bind(2, now_utc());
+        stmt.bind(3, output.substr(0, 1024 * 1024));
+        stmt.bind(4, error.substr(0, 65536));
+        stmt.bind(5, job_id);
+        stmt.step_done();
+        Statement clear(db.get(),
+            "UPDATE repositories SET operation='', modified_at=? "
+            "WHERE id=(SELECT repo_id FROM jobs WHERE id=?)");
+        clear.bind(1, now_utc());
+        clear.bind(2, job_id);
+        clear.step_done();
+        db.exec("COMMIT;");
+    } catch (...) {
+        db.exec("ROLLBACK;");
+        throw;
+    }
 }
 
 void Database::requeue_job(std::int64_t job_id, const std::string& message, int delay_seconds) {
@@ -762,14 +831,27 @@ void Database::requeue_job(std::int64_t job_id, const std::string& message, int 
     // in C++, so it's guaranteed to use the exact same "YYYY-MM-DD HH:MM:SS" format that
     // claim_next_job compares scheduled_at against — now_utc() produces a different
     // (ISO 8601 'T'/'Z') format that would silently never compare as due.
-    Statement stmt(db.get(),
-        "UPDATE jobs SET status='queued', started_at='', message=?, "
-        "scheduled_at = CASE WHEN ?2 > 0 THEN datetime('now', '+' || ?2 || ' seconds') ELSE '' END "
-        "WHERE id=?3");
-    stmt.bind(1, message);
-    stmt.bind(2, delay_seconds);
-    stmt.bind(3, job_id);
-    stmt.step_done();
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        Statement stmt(db.get(),
+            "UPDATE jobs SET status='queued', started_at='', message=?, "
+            "scheduled_at = CASE WHEN ?2 > 0 THEN datetime('now', '+' || ?2 || ' seconds') ELSE '' END "
+            "WHERE id=?3");
+        stmt.bind(1, message);
+        stmt.bind(2, delay_seconds);
+        stmt.bind(3, job_id);
+        stmt.step_done();
+        Statement clear(db.get(),
+            "UPDATE repositories SET operation='', modified_at=? "
+            "WHERE id=(SELECT repo_id FROM jobs WHERE id=?)");
+        clear.bind(1, now_utc());
+        clear.bind(2, job_id);
+        clear.step_done();
+        db.exec("COMMIT;");
+    } catch (...) {
+        db.exec("ROLLBACK;");
+        throw;
+    }
 }
 
 void Database::delay_pending_github_jobs(int delay_seconds) {

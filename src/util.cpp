@@ -450,7 +450,11 @@ std::string status_label(std::string_view status) {
     if (status == "metadata") return "Metadata";
     if (status == "ready") return "Ready";
     if (status == "missing") return "Missing";
+    if (status == "healthy") return "Healthy";
     if (status == "unhealthy") return "Unhealthy";
+    if (status == "remote-missing") return "Remote missing";
+    if (status == "rate-limited") return "Rate limited";
+    if (status == "unknown") return "Unknown";
     if (status == "error") return "Error";
     return std::string(status);
 }
