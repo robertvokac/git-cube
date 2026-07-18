@@ -208,23 +208,6 @@ int main() {
                 "Unlisted Host header must be rejected");
         require(!gitcube::valid_http_host("localhost:1234", 9999, allowed_hosts),
                 "Wrong Host port must be rejected");
-        require(gitcube::valid_http_origin("http://localhost:9999",
-                                           "localhost:9999", 9999, allowed_hosts),
-                "Same-origin Origin header was rejected");
-        require(gitcube::valid_http_origin("https://localhost:9999",
-                                           "localhost:9999", 9999, allowed_hosts),
-                "HTTPS reverse-proxy origin was rejected");
-        const std::vector<std::string> proxy_hosts{"gitcube.example"};
-        require(gitcube::valid_http_origin("https://gitcube.example",
-                                           "gitcube.example", 9999, proxy_hosts),
-                "HTTPS origin without an external port was rejected");
-        require(!gitcube::valid_http_origin("https://gitcube.example",
-                                            "localhost:9999", 9999, proxy_hosts),
-                "Origin and Host mismatch must be rejected");
-        require(!gitcube::valid_http_origin("http://evil.example:9999",
-                                            "localhost:9999", 9999,
-                                            allowed_hosts),
-                "Cross-origin Origin header must be rejected");
 
         std::atomic<bool> http_shutdown{false};
         const bool run_socket_tests =
@@ -274,7 +257,8 @@ int main() {
             const std::string cross_origin = exchange_http(
                 http_server,
                 "POST /hello HTTP/1.1\r\nHost: localhost:9999\r\n"
-                "Origin: http://evil.example:9999\r\nContent-Length: 0\r\n\r\n");
+                "Origin: http://evil.example:9999\r\n"
+                "Sec-Fetch-Site: cross-site\r\nContent-Length: 0\r\n\r\n");
             require(
                 cross_origin.find("HTTP/1.1 403 Forbidden") !=
                         std::string::npos &&
@@ -748,6 +732,53 @@ FROM counter;
         auto& status_database =
             gitcube::ApplicationTestAccess::database(status_application);
         status_database.initialize();
+        if (run_socket_tests) {
+            gitcube::HttpServer application_server(
+                "127.0.0.1", 9999, {},
+                [&](const gitcube::HttpRequest& request) {
+                    return gitcube::ApplicationTestAccess::handle(
+                        status_application, request);
+                },
+                application_shutdown);
+            const std::string add_page = exchange_http(
+                application_server,
+                "GET /add HTTP/1.1\r\nHost: localhost:9999\r\n\r\n");
+            constexpr std::string_view csrf_marker =
+                "name=\"csrf\" value=\"";
+            const auto csrf_start = add_page.find(csrf_marker);
+            require(csrf_start != std::string::npos,
+                    "Add page did not contain a CSRF token");
+            const auto csrf_value_start = csrf_start + csrf_marker.size();
+            const auto csrf_end = add_page.find('"', csrf_value_start);
+            require(csrf_end != std::string::npos,
+                    "Add page contained a malformed CSRF token");
+            const std::string csrf =
+                add_page.substr(csrf_value_start, csrf_end - csrf_value_start);
+            const std::string missing_csrf_response = exchange_http(
+                application_server,
+                "POST /import HTTP/1.1\r\nHost: localhost:9999\r\n"
+                "Origin: null\r\nContent-Length: 0\r\n\r\n");
+            require(
+                missing_csrf_response.find(
+                    "HTTP/1.1 400 Bad Request") != std::string::npos &&
+                    status_database.queued_job_count() == 0,
+                "POST without a CSRF token reached the application route");
+            const std::string import_body =
+                "csrf=" + csrf +
+                "&urls=https%3A%2F%2Fgithub.com%2Fopeneggbert";
+            const std::string import_request =
+                "POST /import HTTP/1.1\r\nHost: localhost:9999\r\n"
+                "Origin: null\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                "Content-Length: " + std::to_string(import_body.size()) +
+                "\r\n\r\n" + import_body;
+            const std::string import_response =
+                exchange_http(application_server, import_request);
+            require(
+                import_response.find("HTTP/1.1 303 See Other") !=
+                        std::string::npos &&
+                    status_database.queued_job_count() == 1,
+                "Valid CSRF-protected import was blocked by its Origin header");
+        }
         const auto first_status_repo = status_database.add_repository(*encoded_name);
         const auto second_status_repo =
             status_database.add_repository(*underscore_name);

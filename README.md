@@ -341,7 +341,7 @@ them depend on a web framework or ORM:
 | `application.hpp/.cpp` | HTTP route dispatch and every page/handler — the only place that renders HTML or reads `HttpRequest`. Owns the worker threads and the CSRF token. |
 | `git_service.hpp/.cpp` | Every `git`/`curl` invocation: clone, fetch, health check, GitHub metadata, GitHub account listing, tree/blob/commit/archive reads. Takes a `Job` or `Repository`, never an `HttpRequest`. |
 | `database.hpp/.cpp` | The only file that touches SQLite. Schema, migrations, and every query, wrapped around a tiny RAII `Connection`/`Statement` pair (not a public API — see below). |
-| `http_server.hpp/.cpp` | The HTTP/1.1 server itself: POSIX sockets, bounded client queue and fixed worker pool, request parsing, Host/Origin checks, response deadlines and security headers. Knows nothing about GitCube's routes. |
+| `http_server.hpp/.cpp` | The HTTP/1.1 server itself: POSIX sockets, bounded client queue and fixed worker pool, request parsing, Host/Fetch-Metadata checks, response deadlines and security headers. Knows nothing about GitCube's routes. |
 | `process.hpp/.cpp` | `posix_spawnp`/`waitpid` wrapper used for every child process, with separate stdout/stderr capture, a timeout, and graceful-shutdown-aware process-group termination. |
 | `json.hpp/.cpp` | A small recursive-descent JSON parser (with a nesting-depth cap) used to read GitHub API responses. Not a general-purpose library. |
 | `util.hpp/.cpp` | URL/repository-URL parsing and validation, HTML/JSON/URL escaping, the Markdown renderer, ref/path validation. |
@@ -442,12 +442,11 @@ the optimization cannot turn a temporary traffic spike into an unbounded RAM cac
   single-user local tool, same trust boundary as a CLI. A non-loopback bind is refused
   unless `--allow-remote-unauthenticated` and at least one `--allowed-host` are both
   supplied; that explicit escape hatch still needs authentication and TLS in front of it.
-- HTTP/1.1 requests must use an allowed `Host`; cross-site browser POSTs and mismatched
-  `Origin` headers are rejected to limit DNS-rebinding and cross-origin attacks. Both
-  HTTP and HTTPS origins are supported when their authority matches that validated
-  `Host`, so a TLS reverse proxy can preserve the browser's original origin.
-- Every POST requires a per-process CSRF token embedded in the page (checked in
-  `Application::valid_csrf`).
+- HTTP/1.1 requests must use an allowed `Host`, and browser requests explicitly marked
+  `Sec-Fetch-Site: cross-site` are rejected. `Origin` is not reconstructed across
+  reverse proxies because that is ambiguous and would reject legitimate opaque origins.
+- Every POST is centrally required to carry the per-process CSRF token embedded in the
+  page (checked in `Application::handle_request` before route dispatch).
 - `git`/`curl`/`zip` are invoked with `posix_spawnp` and an argument array — **never** through
   a shell, so there's no shell-metacharacter injection surface regardless of what a
   repository URL, ref name or file path contains.

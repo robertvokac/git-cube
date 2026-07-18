@@ -311,6 +311,11 @@ void Application::worker_loop(int worker_number) {
 }
 
 HttpResponse Application::handle_request(const HttpRequest& request) {
+    // Enforce CSRF centrally so every current and future state-changing route is
+    // protected without depending on proxy-sensitive Origin reconstruction.
+    if (request.method == "POST" && !valid_csrf(request)) {
+        return HttpResponse::text("Invalid CSRF token", 400);
+    }
     if (request.method == "GET" && request.path == "/") return dashboard(request);
     if (request.method == "GET" && request.path == "/add") return add_repositories_page();
     if (request.method == "GET" && request.path == "/jobs") return jobs_page(request);
@@ -870,7 +875,6 @@ HttpResponse Application::commit_page(std::int64_t id, const HttpRequest& reques
 }
 
 HttpResponse Application::archive_ref_download(std::int64_t id, const HttpRequest& request) {
-    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
     auto archive_lease = try_acquire_archive_slot();
     if (!archive_lease) return HttpResponse::text("Another export is already running", 503);
     const auto repo = database_.get_repository(id);
@@ -896,8 +900,7 @@ HttpResponse Application::archive_ref_download(std::int64_t id, const HttpReques
     return response;
 }
 
-HttpResponse Application::archive_git_download(std::int64_t id, const HttpRequest& request) {
-    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
+HttpResponse Application::archive_git_download(std::int64_t id, const HttpRequest&) {
     auto archive_lease = try_acquire_archive_slot();
     if (!archive_lease) return HttpResponse::text("Another export is already running", 503);
     const auto repo = database_.get_repository(id);
@@ -963,7 +966,6 @@ HttpResponse Application::check_repo_api(const HttpRequest& request) {
 }
 
 HttpResponse Application::import_repositories(const HttpRequest& request) {
-    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
     const auto form = parse_urlencoded(request.body);
     const auto it = form.find("urls");
     if (it == form.end()) return HttpResponse::redirect("/?error=" + url_encode("No repository URLs supplied"));
@@ -1008,8 +1010,7 @@ HttpResponse Application::import_repositories(const HttpRequest& request) {
     return HttpResponse::redirect("/?notice=" + url_encode(notice));
 }
 
-HttpResponse Application::enqueue_bulk(const HttpRequest& request, const std::string& type) {
-    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
+HttpResponse Application::enqueue_bulk(const HttpRequest&, const std::string& type) {
     const auto count = database_.enqueue_all(type);
     notify_workers();
     return HttpResponse::redirect("/?notice=" + url_encode("Queued " + std::to_string(count) + " " + type + " jobs"));
@@ -1017,7 +1018,6 @@ HttpResponse Application::enqueue_bulk(const HttpRequest& request, const std::st
 
 HttpResponse Application::repository_action(std::int64_t id, const std::string& action,
                                             const HttpRequest& request) {
-    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
     const auto repo = database_.get_repository(id);
     if (!repo) return HttpResponse::text("Repository not found", 404);
     std::string notice;
