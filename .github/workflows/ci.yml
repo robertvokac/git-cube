@@ -49,6 +49,24 @@ jobs:
         run: cmake --build build --parallel 2
       - name: Test
         run: ctest --test-dir build --output-on-failure --parallel 2
+      - name: Verify install layout
+        if: matrix.build_type == 'Release'
+        env:
+          DESTDIR: ${{ runner.temp }}/gitcube-stage
+        run: |
+          cmake --install build
+          test -x "${DESTDIR}/usr/local/bin/gitcube"
+          test -f "${DESTDIR}/usr/local/share/systemd/user/gitcube.service"
+          test -f "${DESTDIR}/usr/local/share/doc/gitcube/LICENSE"
+      - name: Build release archive
+        if: matrix.build_type == 'Release'
+        run: cpack --config build/CPackConfig.cmake -G TGZ
+      - uses: actions/upload-artifact@v4
+        if: matrix.build_type == 'Release'
+        with:
+          name: gitcube-release-archive
+          path: gitcube-*.tar.gz
+          if-no-files-found: error
 
   static-analysis:
     name: Cppcheck

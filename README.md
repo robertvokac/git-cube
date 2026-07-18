@@ -10,6 +10,7 @@ on disk.
 
 - [Features](#features)
 - [Quick start](#quick-start)
+- [Installation and systemd user service](#installation-and-systemd-user-service)
 - [User guide](#user-guide)
   - [Adding repositories](#adding-repositories)
   - [The repository list](#the-repository-list)
@@ -92,6 +93,42 @@ GitCube holds an exclusive lock on that directory; a second instance exits befor
 can recover jobs or touch clone staging directories.
 
 Open `http://127.0.0.1:9999`.
+
+## Installation and systemd user service
+
+For a user-local installation (no root required), configure the final prefix up front,
+then install:
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build build-release --parallel 2
+cmake --install build-release
+systemctl --user daemon-reload
+systemctl --user enable --now gitcube.service
+```
+
+This installs the binary under `~/.local/bin`, documentation under
+`~/.local/share/doc/gitcube`, and the generated unit under
+`~/.local/share/systemd/user`. The unit's absolute `ExecStart` is derived from the
+prefix used at configure time, so do not change the prefix only at the later
+`cmake --install` step.
+
+The example service runs two Git workers and places its data in
+`~/.local/share/gitcube`. Its cgroup uses soft/hard memory thresholds of 2/4 GiB, allows
+at most 1 GiB of swap and 128 tasks, and stops cleanly on cgroup OOM so the ordinary
+restart/recovery path can requeue interrupted work. Adjust these for unusually large
+repositories with `systemctl --user edit gitcube.service`.
+
+To build a release archive targeting a conventional `/usr/local` installation,
+configure with `-DCMAKE_INSTALL_PREFIX=/usr/local` and run:
+
+```bash
+cpack --config build-release/CPackConfig.cmake -G TGZ
+```
+
+CI exercises the staged install layout and publishes this TGZ archive from the Release
+build. Installation never enables or starts the service automatically.
 
 ## User guide
 

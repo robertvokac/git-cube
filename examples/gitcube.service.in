@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/gitcube --data-dir %h/.local/share/gitcube --port 9999 --workers 2
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/gitcube --data-dir %h/.local/share/gitcube --port 9999 --workers 2
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
@@ -22,6 +22,12 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=%h/.local/share/gitcube
+MemoryHigh=2G
+MemoryMax=4G
+MemorySwapMax=1G
+TasksMax=128
+LimitNOFILE=4096
+OOMPolicy=stop
 
 [Install]
 WantedBy=default.target

@@ -76,6 +76,11 @@ warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake
 dedicated warnings/sanitizer/coverage options, all CI builds are capped at two parallel
 tasks, and CTest enforces a per-test timeout.
 
+**Installation and packaging** — GNUInstallDirs drives binary/documentation/systemd
+destinations, the user unit is generated from the configured prefix, and CPack produces
+a TGZ release archive. Release CI verifies the staged layout and uploads the archive.
+The service cgroup has explicit memory, swap, task and descriptor limits.
+
 **Security hardening pass** (found via review, fixed and verified in the same session):
 SVG/HTML/XML raw-blob content-type XSS, a job-queue race allowing duplicate concurrent
 jobs, per-repo job mutual exclusion, interrupted/paused jobs being recorded as permanent
