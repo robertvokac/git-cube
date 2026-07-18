@@ -86,6 +86,11 @@ Run it:
 ./build/gitcube
 ```
 
+Unless `--data-dir` is supplied, persistent data is stored under
+`$XDG_DATA_HOME/gitcube`, or `~/.local/share/gitcube` when `XDG_DATA_HOME` is unset.
+GitCube holds an exclusive lock on that directory; a second instance exits before it
+can recover jobs or touch clone staging directories.
+
 Open `http://127.0.0.1:9999`.
 
 ## User guide
@@ -235,7 +240,7 @@ gets the graceful shutdown either.
 ## Command-line reference
 
 ```text
---data-dir PATH   Data directory, default ./data
+--data-dir PATH   Data directory, default $XDG_DATA_HOME/gitcube
 --port PORT       HTTP port, default 9999
 --workers COUNT   Concurrent Git workers, default 2
 --bind ADDRESS    IPv4 bind address, default 127.0.0.1
@@ -310,6 +315,9 @@ A clone is written to `data/tmp/clone-<repo>-<job>.git` and only `rename()`d int
 final path after `git clone --mirror` exits successfully — an interrupted clone can
 never appear as a completed repository, and any leftover staging directory found in
 `data/tmp` at startup (from a hard crash) is removed automatically.
+
+The data directory and newly created contents are owner-only by default. A process-wide
+`gitcube.lock` prevents two instances from recovering or executing the same queue.
 
 ### Database schema and migrations
 

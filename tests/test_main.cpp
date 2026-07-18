@@ -1,3 +1,4 @@
+#include "data_directory_lock.hpp"
 #include "database.hpp"
 #include "json.hpp"
 #include "util.hpp"
@@ -5,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <unistd.h>
 
 namespace {
 void require(bool condition, const char* message) {
@@ -37,9 +39,25 @@ int main() {
         require(json->get("id") && json->get("id")->integer() == 123, "JSON integer failed");
         require(json->get("items") && json->get("items")->array().size() == 2, "JSON array failed");
 
-        const auto temp = std::filesystem::temp_directory_path() / "gitcube-test-db";
+        const auto temp = std::filesystem::temp_directory_path() /
+            ("gitcube-test-" + std::to_string(static_cast<long long>(getpid())) + "-" +
+             std::to_string(static_cast<unsigned long long>(
+                std::filesystem::file_time_type::clock::now().time_since_epoch().count())));
         std::filesystem::remove_all(temp);
         std::filesystem::create_directories(temp);
+        {
+            gitcube::DataDirectoryLock first_lock(temp);
+            bool second_lock_failed = false;
+            try {
+                gitcube::DataDirectoryLock second_lock(temp);
+            } catch (const std::exception&) {
+                second_lock_failed = true;
+            }
+            require(second_lock_failed, "A second data-directory lock must be rejected");
+        }
+        {
+            gitcube::DataDirectoryLock lock_after_release(temp);
+        }
         gitcube::Database db(temp / "gitcube.sqlite3");
         db.initialize();
         const auto added = db.add_repository(*github);

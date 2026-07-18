@@ -2,11 +2,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
 
 namespace {
 volatile std::sig_atomic_t signal_received = 0;
@@ -19,7 +21,7 @@ void print_usage(const char* program) {
     std::cout << "GitCube 0.1.0\n\n"
               << "Usage: " << program << " [options]\n\n"
               << "Options:\n"
-              << "  --data-dir PATH   Data directory (default: ./data)\n"
+              << "  --data-dir PATH   Data directory (default: $XDG_DATA_HOME/gitcube)\n"
               << "  --port PORT       HTTP port (default: 9999)\n"
               << "  --workers COUNT   Concurrent Git workers (default: 2)\n"
               << "  --bind ADDRESS    IPv4 address (default: 127.0.0.1)\n"
@@ -37,11 +39,23 @@ int parse_integer(const std::string& value, const char* name, int minimum, int m
     }
     return parsed;
 }
+
+std::filesystem::path default_data_directory() {
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg) {
+        const std::filesystem::path path(xdg);
+        if (path.is_absolute()) return path / "gitcube";
+    }
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".local" / "share" / "gitcube";
+    }
+    return std::filesystem::current_path() / "data";
+}
 }
 
 int main(int argc, char** argv) {
     gitcube::Config config;
-    config.data_dir = std::filesystem::current_path() / "data";
+    config.data_dir = default_data_directory();
+    umask(S_IRWXG | S_IRWXO);
 
     try {
         for (int i = 1; i < argc; ++i) {

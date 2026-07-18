@@ -9,10 +9,18 @@ ExecStart=/usr/local/bin/gitcube --data-dir %h/.local/share/gitcube --port 9999 
 Restart=on-failure
 RestartSec=5
 KillSignal=SIGTERM
-TimeoutStopSec=20
+TimeoutStopSec=60
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=%h/.local/share/gitcube
 
 [Install]

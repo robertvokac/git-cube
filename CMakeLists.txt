@@ -9,6 +9,7 @@ find_package(Threads REQUIRED)
 find_package(SQLite3 REQUIRED)
 
 add_library(gitcube_core
+    src/data_directory_lock.cpp
     src/util.cpp
     src/json.cpp
     src/database.cpp

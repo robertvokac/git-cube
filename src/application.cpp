@@ -1,5 +1,6 @@
 #include "application.hpp"
 
+#include "data_directory_lock.hpp"
 #include "favicon_assets.hpp"
 #include "util.hpp"
 
@@ -116,11 +117,21 @@ Application::Application(Config config, std::atomic<bool>& shutdown_requested)
 
 int Application::run() {
     try {
-        std::filesystem::create_directories(config_.data_dir / "repositories");
-        std::filesystem::create_directories(config_.data_dir / "tmp");
-        std::filesystem::create_directories(config_.data_dir / "logs");
-        std::filesystem::create_directories(config_.data_dir / "cache");
+        std::filesystem::create_directories(config_.data_dir);
+        std::filesystem::permissions(config_.data_dir, std::filesystem::perms::owner_all,
+                                     std::filesystem::perm_options::replace);
+        DataDirectoryLock data_directory_lock(config_.data_dir);
+        for (const char* directory : {"repositories", "tmp", "logs", "cache"}) {
+            const auto path = config_.data_dir / directory;
+            std::filesystem::create_directories(path);
+            std::filesystem::permissions(path, std::filesystem::perms::owner_all,
+                                         std::filesystem::perm_options::replace);
+        }
         database_.initialize();
+        std::filesystem::permissions(database_.path(),
+                                     std::filesystem::perms::owner_read |
+                                         std::filesystem::perms::owner_write,
+                                     std::filesystem::perm_options::replace);
         database_.recover_interrupted_jobs();
         cleanup_orphaned_temp_dirs();
         start_workers();
