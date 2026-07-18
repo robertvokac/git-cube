@@ -34,7 +34,7 @@ jobs:
             cxx: clang++
             build_type: Debug
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libsqlite3-dev git zip curl
       - name: Configure
@@ -61,7 +61,7 @@ jobs:
       - name: Build release archive
         if: matrix.build_type == 'Release'
         run: cpack --config build/CPackConfig.cmake -G TGZ
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: matrix.build_type == 'Release'
         with:
           name: gitcube-release-archive
@@ -72,7 +72,7 @@ jobs:
     name: Cppcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y cppcheck
       - name: Analyze
@@ -90,7 +90,7 @@ jobs:
     name: ASan + UBSan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libsqlite3-dev git zip curl
       - name: Configure
@@ -111,7 +111,7 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y ninja-build libsqlite3-dev git zip curl gcovr
       - name: Configure
@@ -125,23 +125,24 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Report coverage
-        run: >
-          gcovr --root .
-          --filter 'src/'
-          --exclude 'src/main.cpp'
-          --txt-summary
-          --fail-under-line 30
-          build/CMakeFiles/gitcube_core.dir
-      - name: Write coverage artifact
-        run: >
-          gcovr --root .
-          --filter 'src/'
-          --exclude 'src/main.cpp'
-          --xml-pretty
-          --output coverage.xml
-          build/CMakeFiles/gitcube_core.dir
-      - uses: actions/upload-artifact@v4
+        shell: bash
+        run: |
+          mapfile -t coverage_files < <(
+            find build/CMakeFiles/gitcube_core.dir -type f -name '*.gcda' -print
+          )
+          test "${#coverage_files[@]}" -ge 8
+          gcovr "${coverage_files[@]}" \
+            --root . \
+            --filter 'src/' \
+            --exclude 'src/main.cpp' \
+            --txt-summary \
+            --xml coverage.xml \
+            --xml-pretty \
+            --fail-under-line 30
+          test -s coverage.xml
+      - uses: actions/upload-artifact@v6
         if: always()
         with:
           name: coverage-report
           path: coverage.xml
+          if-no-files-found: error
