@@ -76,7 +76,7 @@ Build and test:
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 ```
 
@@ -227,7 +227,8 @@ after a hard crash.
 count, the message GitCube recorded, and — on failure — the captured command output.
 Account-import jobs (no single repository) show the GitHub account name instead of a
 repository link. Retention keeps the latest 5,000 finished jobs and full command output
-for the latest 200; queued/running jobs are never removed.
+for the latest 200; queued/running jobs are never removed. The paginated overview loads
+at most the first 64 KiB of output and 16 KiB of error text per row.
 
 **Fetch all** / **Check all** on the home page bulk-queue a fetch or health job for
 every eligible repository (skipping paused ones, and — for fetch — repositories that
@@ -324,7 +325,7 @@ Application::handle_request  →  route dispatch  →  page/API handlers
         ▲                                                 │
         │ claim_next_job() / finish_job()                 │ runs
         │                                                  ▼
-  worker thread pool  ─────────────────────────────  ProcessRunner (fork/exec)
+  worker thread pool  ────────────────────────  ProcessRunner (posix_spawnp/waitpid)
 ```
 
 Everything that mutates repository/job state — clone, fetch, health check, GitHub
@@ -374,6 +375,7 @@ const Migration kMigrations[] = {
     {5, R"SQL( ... )SQL"},   // separates availability, operation, health and metadata state
     {6, R"SQL( ... )SQL"},   // adds indexed canonical URL identity for legacy rows
     {7, R"SQL( ... )SQL"},   // adds active-job, retention and release-order indexes
+    {8, R"SQL( ... )SQL"},   // normalizes legacy field sizes to response-safe bounds
 };
 ```
 

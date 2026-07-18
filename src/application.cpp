@@ -595,7 +595,10 @@ HttpResponse Application::jobs_page(const HttpRequest& request) {
             body << "</div><div class=\"muted\">Queued " << html_escape(job.queued_at) << " · Started " << html_escape(job.started_at)
                  << " · Finished " << html_escape(job.finished_at) << " · Attempt " << job.attempts << "</div><p>" << html_escape(job.message) << "</p>";
             if (!job.error.empty()) body << "<p class=\"error\">" << html_escape(job.error) << "</p>";
-            if (!job.output.empty()) body << "<details><summary>Command output</summary><pre>" << html_escape(job.output) << "</pre></details>";
+            if (!job.output.empty()) {
+                body << "<details><summary>Command output (up to 64 KiB)</summary><pre>"
+                     << html_escape(job.output) << "</pre></details>";
+            }
             body << "</div>";
         }
 

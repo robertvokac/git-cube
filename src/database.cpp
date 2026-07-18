@@ -90,6 +90,39 @@ CREATE INDEX IF NOT EXISTS idx_jobs_terminal_id
 CREATE INDEX IF NOT EXISTS idx_releases_repo_published
   ON releases(repo_id,published_at DESC);
 )SQL"},
+    {8, R"SQL(
+UPDATE repositories SET
+ default_branch=substr(default_branch,1,4096),
+ description=substr(description,1,16384),
+ homepage=substr(homepage,1,2048),
+ html_url=substr(html_url,1,2048),
+ license=substr(license,1,1024),
+ created_at=substr(created_at,1,128),
+ updated_at=substr(updated_at,1,128),
+ pushed_at=substr(pushed_at,1,128),
+ last_error=substr(last_error,1,65536),
+ health_error=substr(health_error,1,65536),
+ metadata_error=substr(metadata_error,1,65536),
+ head_oid=substr(head_oid,1,256),
+ github_metadata_json=substr(github_metadata_json,1,8388608);
+UPDATE jobs SET
+ message=substr(message,1,16384),
+ payload=substr(payload,1,4096),
+ output=substr(output,1,1048576),
+ error=substr(error,1,65536);
+DELETE FROM refs WHERE length(name)>4096;
+UPDATE refs SET target_oid=substr(target_oid,1,256);
+UPDATE repositories SET
+ branch_count=(SELECT count(*) FROM refs
+               WHERE refs.repo_id=repositories.id AND refs.type='branch'),
+ tag_count=(SELECT count(*) FROM refs
+            WHERE refs.repo_id=repositories.id AND refs.type='tag');
+UPDATE releases SET
+ tag_name=substr(tag_name,1,4096),
+ name=substr(name,1,8192),
+ html_url=substr(html_url,1,2048),
+ published_at=substr(published_at,1,128);
+)SQL"},
 };
 
 constexpr std::size_t kMaxJobMessageBytes = 16 * 1024;
@@ -98,6 +131,19 @@ constexpr std::size_t kMaxJobOutputBytes = 1024 * 1024;
 constexpr std::size_t kMaxJobErrorBytes = 64 * 1024;
 constexpr std::size_t kRetainedFinishedJobs = 5000;
 constexpr std::size_t kRetainedJobOutputs = 200;
+constexpr std::size_t kMaxRepositoryErrorBytes = 64 * 1024;
+constexpr std::size_t kMaxDescriptionBytes = 16 * 1024;
+constexpr std::size_t kMaxUrlBytes = 2048;
+constexpr std::size_t kMaxDefaultBranchBytes = 4096;
+constexpr std::size_t kMaxLicenseBytes = 1024;
+constexpr std::size_t kMaxTimestampBytes = 128;
+constexpr std::size_t kMaxOidBytes = 256;
+constexpr std::size_t kMaxRefNameBytes = 4096;
+constexpr std::size_t kMaxReleaseTagBytes = 4096;
+constexpr std::size_t kMaxReleaseNameBytes = 8192;
+constexpr std::size_t kMaxRawMetadataBytes = 8 * 1024 * 1024;
+constexpr std::size_t kMaxJobListOutputBytes = 64 * 1024;
+constexpr std::size_t kMaxJobListErrorBytes = 16 * 1024;
 
 class Connection {
 public:
@@ -785,7 +831,7 @@ void Database::update_repository_status(std::int64_t id, const std::string& stat
     ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET status=?, last_error=?, modified_at=? WHERE id=?");
     stmt.bind(1, status);
-    stmt.bind(2, error);
+    stmt.bind(2, error.substr(0, kMaxRepositoryErrorBytes));
     stmt.bind(3, now_utc());
     stmt.bind(4, id);
     stmt.step_done();
@@ -812,11 +858,18 @@ void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector
         remove.step_done();
         Statement insert(db.get(), "INSERT INTO refs(repo_id,type,name,target_oid,updated_at) VALUES(?,?,?,?,?)");
         const auto now = now_utc();
+        std::int64_t stored_branches = branches;
+        std::int64_t stored_tags = tags;
         for (const auto& ref : refs) {
+            if (ref.name.size() > kMaxRefNameBytes) {
+                if (ref.type == "branch" && stored_branches > 0) --stored_branches;
+                if (ref.type == "tag" && stored_tags > 0) --stored_tags;
+                continue;
+            }
             insert.bind(1, id);
             insert.bind(2, ref.type);
             insert.bind(3, ref.name);
-            insert.bind(4, ref.target_oid);
+            insert.bind(4, ref.target_oid.substr(0, kMaxOidBytes));
             insert.bind(5, now);
             insert.step_done();
             insert.reset();
@@ -826,10 +879,10 @@ void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector
             "UPDATE repositories SET status='ready', default_branch=?, head_oid=?, branch_count=?, tag_count=?, object_count=?, "
             "last_fetch_at=CASE WHEN ?=1 THEN ? ELSE last_fetch_at END, last_success_at=?, last_error='', modified_at=? WHERE id=?";
         Statement stmt(db.get(), sql);
-        stmt.bind(1, default_branch);
-        stmt.bind(2, head_oid);
-        stmt.bind(3, branches);
-        stmt.bind(4, tags);
+        stmt.bind(1, default_branch.substr(0, kMaxDefaultBranchBytes));
+        stmt.bind(2, head_oid.substr(0, kMaxOidBytes));
+        stmt.bind(3, stored_branches);
+        stmt.bind(4, stored_tags);
         stmt.bind(5, objects);
         stmt.bind(6, fetched ? 1 : 0);
         stmt.bind(7, now);
@@ -852,7 +905,7 @@ void Database::update_repository_health(std::int64_t id, const std::string& heal
     stmt.bind(1, health_status);
     const auto now = now_utc();
     stmt.bind(2, now);
-    stmt.bind(3, error);
+    stmt.bind(3, error.substr(0, kMaxRepositoryErrorBytes));
     stmt.bind(4, now);
     stmt.bind(5, id);
     stmt.step_done();
@@ -864,7 +917,7 @@ void Database::update_repository_metadata_status(std::int64_t id,
     ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET metadata_status=?, metadata_error=?, modified_at=? WHERE id=?");
     stmt.bind(1, metadata_status);
-    stmt.bind(2, error);
+    stmt.bind(2, error.substr(0, kMaxRepositoryErrorBytes));
     stmt.bind(3, now_utc());
     stmt.bind(4, id);
     stmt.step_done();
@@ -879,6 +932,8 @@ void Database::update_github_metadata(std::int64_t id, std::int64_t github_id,
                                       const std::string& updated_at, const std::string& pushed_at,
                                       const std::string& raw_json) {
     ConnectionLease db(pool_, path_);
+    const std::string stored_default_branch =
+        default_branch.substr(0, kMaxDefaultBranchBytes);
     Statement stmt(db.get(), R"SQL(
 UPDATE repositories SET github_repo_id=?, default_branch=CASE WHEN ?='' THEN default_branch ELSE ? END,
  description=?, homepage=?, html_url=?, license=?, archived=?, is_fork=?, stars=?, forks=?,
@@ -886,23 +941,23 @@ UPDATE repositories SET github_repo_id=?, default_branch=CASE WHEN ?='' THEN def
  github_metadata_json=?, metadata_status='ready', metadata_error='', modified_at=? WHERE id=?
 )SQL");
     stmt.bind(1, github_id);
-    stmt.bind(2, default_branch);
-    stmt.bind(3, default_branch);
-    stmt.bind(4, description);
-    stmt.bind(5, homepage);
-    stmt.bind(6, html_url);
-    stmt.bind(7, license);
+    stmt.bind(2, stored_default_branch);
+    stmt.bind(3, stored_default_branch);
+    stmt.bind(4, description.substr(0, kMaxDescriptionBytes));
+    stmt.bind(5, homepage.substr(0, kMaxUrlBytes));
+    stmt.bind(6, html_url.substr(0, kMaxUrlBytes));
+    stmt.bind(7, license.substr(0, kMaxLicenseBytes));
     stmt.bind(8, archived ? 1 : 0);
     stmt.bind(9, fork ? 1 : 0);
     stmt.bind(10, stars);
     stmt.bind(11, forks);
     stmt.bind(12, open_issues);
-    stmt.bind(13, created_at);
-    stmt.bind(14, updated_at);
-    stmt.bind(15, pushed_at);
+    stmt.bind(13, created_at.substr(0, kMaxTimestampBytes));
+    stmt.bind(14, updated_at.substr(0, kMaxTimestampBytes));
+    stmt.bind(15, pushed_at.substr(0, kMaxTimestampBytes));
     const auto now = now_utc();
     stmt.bind(16, now);
-    stmt.bind(17, raw_json);
+    stmt.bind(17, raw_json.substr(0, kMaxRawMetadataBytes));
     stmt.bind(18, now);
     stmt.bind(19, id);
     stmt.step_done();
@@ -1064,11 +1119,13 @@ JobPage Database::recent_jobs_page(const std::string& status_filter, std::size_t
     const std::size_t page_count = result.total == 0 ? 1 : (result.total + per_page - 1) / per_page;
     page = std::max<std::size_t>(1, std::min(page, page_count));
 
-    Statement stmt(db.get(), R"SQL(
-SELECT id,repo_id,type,status,queued_at,started_at,finished_at,message,payload,output,error,attempts
-FROM jobs WHERE ?1 = '' OR status = ?1
-ORDER BY id DESC LIMIT ?2 OFFSET ?3
-)SQL");
+    const std::string page_sql =
+        "SELECT id,repo_id,type,status,queued_at,started_at,finished_at,message,"
+        "payload,substr(output,1," + std::to_string(kMaxJobListOutputBytes) +
+        "),substr(error,1," + std::to_string(kMaxJobListErrorBytes) +
+        "),attempts FROM jobs WHERE ?1 = '' OR status = ?1 "
+        "ORDER BY id DESC LIMIT ?2 OFFSET ?3";
+    Statement stmt(db.get(), page_sql);
     stmt.bind(1, status_filter);
     stmt.bind(2, static_cast<std::int64_t>(per_page));
     stmt.bind(3, static_cast<std::int64_t>((page - 1) * per_page));
@@ -1162,10 +1219,10 @@ void Database::replace_releases(std::int64_t repo_id, const std::vector<ReleaseR
         for (const auto& release : releases) {
             insert.bind(1, repo_id);
             insert.bind(2, release.github_id);
-            insert.bind(3, release.tag_name);
-            insert.bind(4, release.name);
-            insert.bind(5, release.html_url);
-            insert.bind(6, release.published_at);
+            insert.bind(3, release.tag_name.substr(0, kMaxReleaseTagBytes));
+            insert.bind(4, release.name.substr(0, kMaxReleaseNameBytes));
+            insert.bind(5, release.html_url.substr(0, kMaxUrlBytes));
+            insert.bind(6, release.published_at.substr(0, kMaxTimestampBytes));
             insert.bind(7, release.prerelease ? 1 : 0);
             insert.bind(8, release.draft ? 1 : 0);
             insert.step_done();

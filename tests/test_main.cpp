@@ -411,14 +411,14 @@ SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
                         migrated_repo->health_error == "old fsck failure" &&
                         migrated_repo->metadata_status == "unknown" &&
                         canonical_lookup && canonical_lookup->id == migrated_repo->id,
-                    "Schema v4 repository state did not migrate cleanly to v7");
+                    "Schema v4 repository state did not migrate cleanly to v8");
         }
         {
             gitcube::Database identity_db(temp / "identity.sqlite3");
             identity_db.initialize();
             require(query_integer(
                         temp / "identity.sqlite3",
-                        "SELECT max(version) FROM schema_migrations") == 7,
+                        "SELECT max(version) FROM schema_migrations") == 8,
                     "Fresh database did not reach the expected schema version");
             const auto punctuation = identity_db.add_repository(*encoded_name);
             const auto underscore = identity_db.add_repository(*underscore_name);
@@ -451,7 +451,7 @@ ALTER TABLE repositories DROP COLUMN canonical_url;
                 std::string::npos;
         }
         require(broken_schema_rejected,
-                "Schema verification must reject a database falsely claiming v7");
+                "Schema verification must reject a database falsely claiming v8");
 
         const auto retention_path = temp / "retention.sqlite3";
         {
@@ -487,10 +487,19 @@ FROM counter;
                 retained.recent_jobs_page("success", 1, 1);
             require(newest_finished.items.size() == 1 &&
                         newest_finished.items.front().output.size() ==
-                            1024 * 1024 &&
-                        newest_finished.items.front().error.size() == 64 * 1024,
-                    "Job output or error limit was not enforced");
+                            64 * 1024 &&
+                        newest_finished.items.front().error.size() == 16 * 1024,
+                    "Job list output or error view limit was not enforced");
         }
+        require(query_integer(
+                    retention_path,
+                    "SELECT length(output) FROM jobs ORDER BY id DESC LIMIT 1") ==
+                    1024 * 1024 &&
+                    query_integer(
+                        retention_path,
+                        "SELECT length(error) FROM jobs ORDER BY id DESC LIMIT 1") ==
+                        64 * 1024,
+                "Stored job output or error limit was not enforced");
         require(query_integer(retention_path, "SELECT count(*) FROM jobs") == 5000,
                 "Finished job history was not pruned to 5000 rows");
         require(query_integer(
@@ -651,11 +660,15 @@ FROM counter;
             many_refs.push_back(
                 {"tag", "tag-" + std::to_string(index), "tag-oid"});
         }
+        many_refs.push_back({"branch", std::string(4097, 'r'),
+                             std::string(300, 'o')});
         db.sync_repository_refs_and_stats(added.id, many_refs, "branch-0",
-                                          "branch-oid", 20, 20, 40, false);
+                                          std::string(300, 'h'), 21, 20, 40,
+                                          false);
         require(db.list_refs(added.id, "branch", 7).size() == 7 &&
-                    db.list_refs(added.id, "tag", 9).size() == 9,
-                "Repository ref queries must honor their response limit");
+                    db.list_refs(added.id, "tag", 9).size() == 9 &&
+                    db.list_refs(added.id, "branch", 100).size() == 20,
+                "Repository ref field or response limit was not enforced");
 
         std::vector<gitcube::ReleaseRecord> many_releases;
         for (int index = 0; index < 20; ++index) {
@@ -666,9 +679,25 @@ FROM counter;
                      std::to_string(index),
                  "2026-01-" + std::to_string(index + 10), false, false});
         }
+        many_releases.push_back(
+            {999, std::string(5000, 't'), std::string(9000, 'n'),
+             "https://example.com/" + std::string(3000, 'u'),
+             std::string(200, 'd'), false, false});
         db.replace_releases(added.id, many_releases);
         require(db.list_releases(added.id, 6).size() == 6,
                 "Repository release queries must honor their response limit");
+        const auto stored_releases = db.list_releases(added.id, 25);
+        const auto oversized_release = std::find_if(
+            stored_releases.begin(), stored_releases.end(),
+            [](const gitcube::ReleaseRecord& release) {
+                return release.github_id == 999;
+            });
+        require(oversized_release != stored_releases.end() &&
+                    oversized_release->tag_name.size() == 4096 &&
+                    oversized_release->name.size() == 8192 &&
+                    oversized_release->html_url.size() == 2048 &&
+                    oversized_release->published_at.size() == 128,
+                "Release field limits were not enforced");
         bool excessive_status_ids_rejected = false;
         try {
             db.dashboard_status(std::vector<std::int64_t>(101, added.id));
@@ -731,8 +760,38 @@ FROM counter;
         db.update_repository_health(added.id, "healthy", "");
         repository_state = db.get_repository(added.id);
         require(repository_state && repository_state->health_error.empty() &&
-                    repository_state->metadata_error == "API failed",
+                    repository_state->metadata_error == "API failed" &&
+                    repository_state->branch_count == 20 &&
+                    repository_state->head_oid.size() == 256,
                 "A successful health check must not clear a metadata error");
+
+        db.update_github_metadata(
+            added.id, 123, "main", std::string(17 * 1024, 'd'),
+            "https://example.com/" + std::string(3000, 'h'),
+            "https://example.com/" + std::string(3000, 'u'),
+            std::string(2000, 'l'), false, false, 1, 2, 3,
+            std::string(200, 'c'), std::string(200, 'u'),
+            std::string(200, 'p'), "{}");
+        db.update_repository_status(
+            added.id, "ready", std::string(70 * 1024, 's'));
+        db.update_repository_health(
+            added.id, "error", std::string(70 * 1024, 'h'));
+        db.update_repository_metadata_status(
+            added.id, "error", std::string(70 * 1024, 'm'));
+        repository_state = db.get_repository(added.id);
+        require(repository_state &&
+                    repository_state->description.size() == 16 * 1024 &&
+                    repository_state->homepage.size() == 2048 &&
+                    repository_state->html_url.size() == 2048 &&
+                    repository_state->license.size() == 1024 &&
+                    repository_state->created_at.size() == 128 &&
+                    repository_state->last_error.size() == 64 * 1024 &&
+                    repository_state->health_error.size() == 64 * 1024 &&
+                    repository_state->metadata_error.size() == 64 * 1024,
+                "Repository metadata or diagnostic field limits were not enforced");
+        db.update_repository_status(added.id, "ready");
+        db.update_repository_health(added.id, "healthy", "");
+        db.update_repository_metadata_status(added.id, "ready");
 
         require(db.enqueue_job(added.id, "fetch"), "Fetch job should enqueue");
         const auto fetch_job = db.claim_next_job();

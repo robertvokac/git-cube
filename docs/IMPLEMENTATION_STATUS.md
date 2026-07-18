@@ -3,7 +3,7 @@
 This is a running log of what has shipped and how it was verified, kept for anyone
 tracking the project's progress or picking up development. It intentionally does not
 explain how to use a feature or what GitCube's user-facing limitations are — that's
-[`README.md`](../README.md). Current database schema version: **7** (see
+[`README.md`](../README.md). Current database schema version: **8** (see
 `kMigrations[]` in `src/database.cpp`).
 
 ## Shipped, by area
@@ -66,6 +66,11 @@ terminal-history pruning and release ordering. GitCube retains the latest 5,000 
 jobs and full command output for the latest 200; active/queued work is never pruned.
 Message, payload, output and error fields are capped at write time.
 
+**Bounded rendered data** — schema v8 normalizes oversized legacy metadata, diagnostics,
+refs, releases and job fields; the same byte limits apply to all new writes. Job-list
+rows load only 64 KiB of output and 16 KiB of error text, so HTML/JSON buffering is
+bounded by page size rather than historical database contents.
+
 **Continuous integration** — GitHub Actions blocks on GCC Debug/Release, Clang Debug,
 warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake exposes
 dedicated warnings/sanitizer/coverage options, all CI builds are capped at two parallel
@@ -101,7 +106,8 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
 - Migration convergence tested three ways: a brand-new database, a hand-built
   pre-migration (v1) database, and a database already at v3 — all reach the then-current
   v4 cleanly with no data loss. Automated downgrade fixtures now exercise convergence
-  through schema v6, including state migration and canonical-URL backfill.
+  through schema v8, including state migration, canonical-URL backfill, indexes,
+  retention and legacy field normalization.
 - `verify_schema()` confirmed to actually fire: a hand-built database with a
   `schema_migrations` row falsely claiming v4 while missing the v4 column fails loudly
   at startup with a specific error, instead of a cryptic later query failure.
@@ -115,8 +121,6 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
 
 ## Known gaps (development-facing)
 
-- Dynamic HTML/JSON responses are still buffered, but large raw blobs and ZIP exports
-  now use bounded temporary files streamed by `http_server.cpp`.
 - Repo-browsing routes (tree/blob/commits/archive) run `git` synchronously on the
   HTTP request thread rather than going through the job queue — acceptable because
   they're local reads, but they do block that connection's thread for their duration.
