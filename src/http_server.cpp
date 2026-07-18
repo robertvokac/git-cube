@@ -8,12 +8,14 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <netinet/in.h>
 #include <optional>
 #include <poll.h>
 #include <sstream>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace gitcube {
@@ -22,7 +24,6 @@ namespace {
 constexpr std::size_t kMaxQueuedClients = 64;
 constexpr std::size_t kClientWorkerCount = 16;
 constexpr std::chrono::seconds kRequestDeadline{30};
-constexpr std::chrono::seconds kResponseDeadline{30};
 
 std::string reason_phrase(int status) {
     switch (status) {
@@ -457,6 +458,25 @@ void HttpServer::handle_client(int client_fd) const {
         }
     }
 
+    const auto response_file = response.body_file;
+    const bool remove_response_file = response.remove_body_file;
+    int response_file_descriptor = -1;
+    std::uintmax_t response_size = response.body.size();
+    if (!response_file.empty()) {
+        response_file_descriptor = open(response_file.c_str(), O_RDONLY | O_CLOEXEC);
+        struct stat file_status {};
+        if (response_file_descriptor < 0 ||
+            fstat(response_file_descriptor, &file_status) != 0 ||
+            file_status.st_size < 0) {
+            if (response_file_descriptor >= 0) close(response_file_descriptor);
+            response_file_descriptor = -1;
+            response = HttpResponse::text("Cannot open response file", 500);
+            response_size = response.body.size();
+        } else {
+            response_size = static_cast<std::uintmax_t>(file_status.st_size);
+        }
+    }
+
     response.headers.try_emplace("X-Content-Type-Options", "nosniff");
     response.headers.try_emplace("X-Frame-Options", "DENY");
     response.headers.try_emplace("Referrer-Policy", "no-referrer");
@@ -471,7 +491,7 @@ void HttpServer::handle_client(int client_fd) const {
     head << "HTTP/1.1 " << response.status << ' ' << reason_phrase(response.status)
          << "\r\n";
     head << "Content-Type: " << response.content_type << "\r\n";
-    head << "Content-Length: " << response.body.size() << "\r\n";
+    head << "Content-Length: " << response_size << "\r\n";
     head << "Connection: close\r\n";
     for (const auto& [key, value] : response.headers) {
         head << key << ": " << value << "\r\n";
@@ -479,9 +499,34 @@ void HttpServer::handle_client(int client_fd) const {
     head << "\r\n";
     const std::string header_text = head.str();
     const auto response_deadline =
-        std::chrono::steady_clock::now() + kResponseDeadline;
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(std::max(1, response.send_timeout_seconds));
     if (send_all(client_fd, header_text.data(), header_text.size(), response_deadline)) {
-        send_all(client_fd, response.body.data(), response.body.size(), response_deadline);
+        if (response_file_descriptor >= 0) {
+            char file_buffer[64 * 1024];
+            while (true) {
+                const ssize_t count =
+                    read(response_file_descriptor, file_buffer, sizeof(file_buffer));
+                if (count > 0) {
+                    if (!send_all(client_fd, file_buffer,
+                                  static_cast<std::size_t>(count), response_deadline)) {
+                        break;
+                    }
+                } else if (count < 0 && errno == EINTR) {
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            send_all(client_fd, response.body.data(), response.body.size(),
+                     response_deadline);
+        }
+    }
+    if (response_file_descriptor >= 0) close(response_file_descriptor);
+    if (remove_response_file && !response_file.empty()) {
+        std::error_code ignored;
+        std::filesystem::remove(response_file, ignored);
     }
 }
 

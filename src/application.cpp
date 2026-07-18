@@ -14,9 +14,8 @@
 namespace gitcube {
 namespace {
 
-// Zip archives are fully buffered in memory (this server has no chunked/streaming
-// response support) before being sent, so cap how large one can grow rather than let an
-// oversized repository exhaust memory.
+// ZIP archives are spooled to an owner-only temporary file and streamed by HttpServer.
+// The cap bounds disk/network use and prevents an accidental multi-gigabyte export.
 constexpr std::size_t kMaxArchiveBytes = 500ULL * 1024 * 1024;
 
 std::string random_token() {
@@ -195,7 +194,8 @@ void Application::cleanup_orphaned_temp_dirs() {
     if (!std::filesystem::is_directory(tmp_dir, ec)) return;
     for (const auto& entry : std::filesystem::directory_iterator(tmp_dir, ec)) {
         const std::string name = entry.path().filename().string();
-        if (name.starts_with("clone-") && name.ends_with(".git")) {
+        if ((name.starts_with("clone-") && name.ends_with(".git")) ||
+            name.starts_with("archive-")) {
             std::filesystem::remove_all(entry.path(), ec);
         }
     }
@@ -261,7 +261,7 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         return request.method == "POST" ? repository_action(*id, match[2].str(), request)
                                         : HttpResponse::text("Method not allowed", 405);
     }
-    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(tree|blob|raw|commits|commit|archive|archive-git)$)"))) {
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(tree|blob|raw|commits|commit)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         if (request.method != "GET") return HttpResponse::text("Method not allowed", 405);
@@ -270,9 +270,14 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         if (view == "blob") return blob_page(*id, request);
         if (view == "raw") return raw_blob(*id, request);
         if (view == "commits") return commits_page(*id, request);
-        if (view == "commit") return commit_page(*id, request);
-        if (view == "archive") return archive_ref_download(*id, request);
-        return archive_git_download(*id);
+        return commit_page(*id, request);
+    }
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(archive|archive-git)$)"))) {
+        const auto id = parse_id(match);
+        if (!id) return HttpResponse::text("Invalid repository id", 400);
+        if (request.method != "POST") return HttpResponse::text("Method not allowed", 405);
+        return match[2].str() == "archive" ? archive_ref_download(*id, request)
+                                           : archive_git_download(*id, request);
     }
     return HttpResponse{404, "text/html; charset=utf-8", page("Not found", "<section><h1>Not found</h1><p>The requested page does not exist.</p></section>"), {}};
 }
@@ -305,6 +310,11 @@ bool Application::valid_csrf(const HttpRequest& request) const {
     const auto form = parse_urlencoded(request.body);
     const auto it = form.find("csrf");
     return it != form.end() && it->second == csrf_token_;
+}
+
+std::shared_ptr<void> Application::try_acquire_archive_slot() {
+    if (!archive_slot_.try_acquire()) return {};
+    return std::shared_ptr<void>(this, [this](void*) { archive_slot_.release(); });
 }
 
 HttpResponse Application::dashboard(const HttpRequest& request) {
@@ -542,15 +552,17 @@ HttpResponse Application::repository_page(std::int64_t id) {
     body << "</select><button type=\"submit\" class=\"secondary\">Set</button>" << importance_stars_html(repo->importance)
          << "</form></td></tr>";
     body << "<tr><th>Export</th><td><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap\">"
-         << "<form method=\"get\" action=\"/repo/" << id
-         << "/archive\" style=\"display:flex;gap:10px;align-items:center\"><select name=\"ref\" style=\"width:auto\">";
+         << "<form method=\"post\" action=\"/repo/" << id
+         << "/archive\" style=\"display:flex;gap:10px;align-items:center\"><input type=\"hidden\" name=\"csrf\" value=\""
+         << html_escape(csrf_token_) << "\"><select name=\"ref\" style=\"width:auto\">";
     for (const auto& branch : branches) {
         body << "<option value=\"" << html_escape(branch.name) << "\"" << (branch.name == ref ? " selected" : "") << ">"
              << html_escape(branch.name) << "</option>";
     }
     for (const auto& tag : tags) body << "<option value=\"" << html_escape(tag.name) << "\">" << html_escape(tag.name) << "</option>";
     body << "</select><button type=\"submit\" class=\"secondary\">Download files (.zip)</button></form>"
-         << "<a class=\"button secondary\" href=\"/repo/" << id << "/archive-git\">Download whole repository (.git, .zip)</a>"
+         << action_form("/repo/" + std::to_string(id) + "/archive-git",
+                        "Download whole repository (.git, .zip)", "secondary")
          << "</div></td></tr>";
     body << "<tr><th>Storage</th><td class=\"path\">" << html_escape(repo->storage_relpath) << "</td></tr><tr><th>Default branch</th><td>"
          << html_escape(repo->default_branch.empty() ? "unknown" : repo->default_branch) << "</td></tr><tr><th>HEAD</th><td class=\"path\">"
@@ -672,13 +684,15 @@ HttpResponse Application::raw_blob(std::int64_t id, const HttpRequest& request) 
     const std::string ref = query_value(request, "ref", repo->default_branch.empty() ? "HEAD" : repo->default_branch);
     const std::string path_value = query_value(request, "path");
     std::string error;
-    const auto blob = git_.read_blob(*repo, ref, path_value, 32 * 1024 * 1024, error);
+    auto blob = git_.read_blob_file(*repo, ref, path_value, 32 * 1024 * 1024, error);
     if (!error.empty() || !blob.found) return HttpResponse::text(error.empty() ? "Blob not found" : error, 404);
     if (blob.too_large) return HttpResponse::text("Blob exceeds 32 MiB raw limit", 413);
     HttpResponse response;
     response.status = 200;
     response.content_type = mime_for_path(path_value, blob.binary);
-    response.body = blob.data;
+    response.body_file = std::move(blob.file);
+    response.remove_body_file = true;
+    response.send_timeout_seconds = 120;
     response.headers["Content-Disposition"] = "inline; filename=\"" + safe_header_filename(path_value) + "\"";
     return response;
 }
@@ -717,9 +731,16 @@ HttpResponse Application::commit_page(std::int64_t id, const HttpRequest& reques
 }
 
 HttpResponse Application::archive_ref_download(std::int64_t id, const HttpRequest& request) {
+    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
+    auto archive_lease = try_acquire_archive_slot();
+    if (!archive_lease) return HttpResponse::text("Another export is already running", 503);
     const auto repo = database_.get_repository(id);
     if (!repo) return HttpResponse::text("Repository not found", 404);
-    const std::string ref = query_value(request, "ref", repo->default_branch.empty() ? "HEAD" : repo->default_branch);
+    const auto form = parse_urlencoded(request.body);
+    const auto ref_value = form.find("ref");
+    const std::string ref = ref_value == form.end()
+        ? (repo->default_branch.empty() ? "HEAD" : repo->default_branch)
+        : ref_value->second;
     std::string error;
     const auto archive = git_.archive_ref(*repo, ref, kMaxArchiveBytes, error);
     if (!error.empty() || !archive.found) return HttpResponse::text(error.empty() ? "Could not build archive" : error, 404);
@@ -727,13 +748,19 @@ HttpResponse Application::archive_ref_download(std::int64_t id, const HttpReques
     HttpResponse response;
     response.status = 200;
     response.content_type = "application/zip";
-    response.body = archive.data;
+    response.body_file = archive.file;
+    response.remove_body_file = true;
+    response.send_timeout_seconds = 10 * 60;
+    response.lifetime_guard = std::move(archive_lease);
     const std::string filename = safe_header_filename(repo->owner + "-" + repo->name + "-" + ref) + ".zip";
     response.headers["Content-Disposition"] = "attachment; filename=\"" + filename + "\"";
     return response;
 }
 
-HttpResponse Application::archive_git_download(std::int64_t id) {
+HttpResponse Application::archive_git_download(std::int64_t id, const HttpRequest& request) {
+    if (!valid_csrf(request)) return HttpResponse::text("Invalid CSRF token", 400);
+    auto archive_lease = try_acquire_archive_slot();
+    if (!archive_lease) return HttpResponse::text("Another export is already running", 503);
     const auto repo = database_.get_repository(id);
     if (!repo) return HttpResponse::text("Repository not found", 404);
     std::string error;
@@ -743,7 +770,10 @@ HttpResponse Application::archive_git_download(std::int64_t id) {
     HttpResponse response;
     response.status = 200;
     response.content_type = "application/zip";
-    response.body = archive.data;
+    response.body_file = archive.file;
+    response.remove_body_file = true;
+    response.send_timeout_seconds = 10 * 60;
+    response.lifetime_guard = std::move(archive_lease);
     const std::string filename = safe_header_filename(repo->owner + "-" + repo->name + ".git") + ".zip";
     response.headers["Content-Disposition"] = "attachment; filename=\"" + filename + "\"";
     return response;

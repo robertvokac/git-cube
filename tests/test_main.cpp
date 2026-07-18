@@ -1,5 +1,6 @@
 #include "data_directory_lock.hpp"
 #include "database.hpp"
+#include "git_service.hpp"
 #include "http_server.hpp"
 #include "json.hpp"
 #include "process.hpp"
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <unistd.h>
@@ -125,6 +127,22 @@ int main() {
         require(timeout_duration < std::chrono::seconds(8),
                 "Timed-out child was not terminated promptly");
 
+        const auto streamed_path = temp / "streamed-output";
+        const auto streamed = gitcube::ProcessRunner::run_to_file(
+            {"/usr/bin/printf", "streamed"}, streamed_path, 1024);
+        std::ifstream streamed_input(streamed_path, std::ios::binary);
+        const std::string streamed_text(
+            (std::istreambuf_iterator<char>(streamed_input)),
+            std::istreambuf_iterator<char>());
+        require(streamed.exit_code == 0 && streamed_text == "streamed",
+                "Direct-to-file process output failed");
+
+        const auto oversized_path = temp / "oversized-output";
+        const auto oversized = gitcube::ProcessRunner::run_to_file(
+            {"/usr/bin/seq", "1", "100000"}, oversized_path, 1024);
+        require(oversized.output_too_large,
+                "Direct-to-file output limit was not enforced");
+
         gitcube::Database db(temp / "gitcube.sqlite3");
         db.initialize();
         const auto added = db.add_repository(*github);
@@ -134,6 +152,61 @@ int main() {
         const auto job = db.claim_next_job();
         require(job.has_value() && job->type == "clone", "Clone job should be claimed");
         db.finish_job(job->id, true, "ok", "");
+
+        const auto source_repo = temp / "source";
+        auto git_result = gitcube::ProcessRunner::run(
+            {"git", "init", "-b", "main", source_repo.string()});
+        require(git_result.exit_code == 0, "Test Git repository init failed");
+        {
+            std::ofstream readme(source_repo / "README.md");
+            readme << "# streamed archive test\n";
+        }
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "-C", source_repo.string(), "add", "README.md"});
+        require(git_result.exit_code == 0, "Test Git add failed");
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "-C", source_repo.string(), "-c", "user.name=GitCube Test",
+             "-c", "user.email=gitcube@example.invalid", "commit", "-m", "initial"});
+        require(git_result.exit_code == 0, "Test Git commit failed");
+        const auto mirror = temp / github->relative_storage_path;
+        std::filesystem::create_directories(mirror.parent_path());
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "clone", "--mirror", source_repo.string(), mirror.string()});
+        require(git_result.exit_code == 0, "Test mirror clone failed");
+
+        std::atomic<bool> shutdown_requested{false};
+        gitcube::GitService git_service(temp, db, shutdown_requested);
+        const auto stored_repo = db.get_repository(added.id);
+        require(stored_repo.has_value(), "Stored test repository is missing");
+        std::string git_error;
+        const auto ref_archive =
+            git_service.archive_ref(*stored_repo, "HEAD", 1024 * 1024, git_error);
+        require(git_error.empty() && ref_archive.found &&
+                    std::filesystem::file_size(ref_archive.file) == ref_archive.size,
+                "Streamed ref archive failed");
+        {
+            std::ifstream archive_input(ref_archive.file, std::ios::binary);
+            char magic[2]{};
+            archive_input.read(magic, 2);
+            require(magic[0] == 'P' && magic[1] == 'K',
+                    "Ref archive is not a ZIP file");
+        }
+        const auto tiny_archive =
+            git_service.archive_ref(*stored_repo, "HEAD", 1, git_error);
+        require(tiny_archive.too_large && tiny_archive.file.empty(),
+                "Archive size limit was not enforced");
+
+        const auto raw_blob = git_service.read_blob_file(
+            *stored_repo, "HEAD", "README.md", 1024 * 1024, git_error);
+        require(git_error.empty() && raw_blob.found && !raw_blob.binary &&
+                    std::filesystem::file_size(raw_blob.file) == raw_blob.size,
+                "Streamed raw blob failed");
+
+        const auto bare_archive =
+            git_service.archive_bare_repository(*stored_repo, 4 * 1024 * 1024, git_error);
+        require(git_error.empty() && bare_archive.found &&
+                    std::filesystem::file_size(bare_archive.file) == bare_archive.size,
+                "Streamed bare-repository archive failed");
         std::filesystem::remove_all(temp);
 
         std::cout << "All GitCube tests passed.\n";

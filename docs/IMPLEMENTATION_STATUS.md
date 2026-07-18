@@ -29,7 +29,9 @@ detection with automatic backoff (the triggering job and every other pending Git
 reschedule ~15 minutes out instead of failing permanently).
 
 **Export** — branch/tag as a files-only zip (`git archive`), or the whole bare mirror as
-a zip (re-clonable, no worktree), buffered in memory with a 500 MiB cap.
+a zip (re-clonable, no worktree), generated into an owner-only temporary file and
+streamed with a 500 MiB cap, a global one-export limit, CSRF-protected POST initiation,
+and per-repository locking against concurrent fetch.
 
 **Schema migrations** — an ordered, additive `kMigrations[]` list applied to every
 database (fresh or old) after a frozen v1 `CREATE TABLE` snapshot, plus a
@@ -79,8 +81,8 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
 
 ## Known gaps (development-facing)
 
-- No streaming HTTP responses — `http_server.cpp` buffers a full response in memory
-  before sending, which bounds practical zip-export and raw-blob sizes.
+- Dynamic HTML/JSON responses are still buffered, but large raw blobs and ZIP exports
+  now use bounded temporary files streamed by `http_server.cpp`.
 - SQLite: a fresh `Connection` (and its `PRAGMA` setup) is opened per call rather than
   reused; fine at today's scale, a real cost under heavier concurrent load.
 - Repo-browsing routes (tree/blob/commits/archive) run `git` synchronously on the

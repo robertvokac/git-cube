@@ -7,7 +7,9 @@
 #include <cctype>
 #include <charconv>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
+#include <unistd.h>
 
 namespace gitcube {
 namespace {
@@ -125,6 +127,24 @@ std::filesystem::path GitService::repo_path(const Repository& repo) const {
     return data_dir_ / repo.storage_relpath;
 }
 
+std::filesystem::path GitService::temporary_output_path(
+    const Repository& repo, std::string_view suffix) const {
+    std::filesystem::create_directories(data_dir_ / "tmp");
+    const auto serial = temporary_file_counter_.fetch_add(1, std::memory_order_relaxed);
+    return data_dir_ / "tmp" /
+        ("archive-" + std::to_string(repo.id) + "-" +
+         std::to_string(static_cast<long long>(getpid())) + "-" +
+         std::to_string(serial) + std::string(suffix));
+}
+
+std::shared_ptr<std::shared_mutex> GitService::repository_lock(
+    std::int64_t repo_id) const {
+    std::lock_guard lock(repository_locks_mutex_);
+    auto& mutex = repository_locks_[repo_id];
+    if (!mutex) mutex = std::make_shared<std::shared_mutex>();
+    return mutex;
+}
+
 std::vector<std::string> GitService::git_args(const Repository& repo,
                                               std::initializer_list<std::string> args) const {
     std::vector<std::string> result{
@@ -152,9 +172,19 @@ JobExecutionResult GitService::execute(const Job& job) {
     if (!repo) return {false, {}, "Repository no longer exists"};
     if (repo->paused) return requeue_result({}, "Repository was paused; job requeued");
 
-    if (job.type == "clone") return clone_repository(job, *repo);
-    if (job.type == "fetch") return fetch_repository(job, *repo);
-    if (job.type == "health") return health_repository(job, *repo);
+    const auto lock = repository_lock(repo->id);
+    if (job.type == "clone") {
+        std::unique_lock guard(*lock);
+        return clone_repository(job, *repo);
+    }
+    if (job.type == "fetch") {
+        std::unique_lock guard(*lock);
+        return fetch_repository(job, *repo);
+    }
+    if (job.type == "health") {
+        std::shared_lock guard(*lock);
+        return health_repository(job, *repo);
+    }
     if (job.type == "metadata") return metadata_repository(job, *repo);
     return {false, {}, "Unknown job type: " + job.type};
 }
@@ -496,6 +526,7 @@ std::string GitService::classify_git_failure(const std::string& output) const {
 
 std::vector<TreeEntry> GitService::list_tree(const Repository& repo, const std::string& ref,
                                              const std::string& path, std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     if (!repository_available(repo)) { error = "Repository is not available locally"; return {}; }
     if (!valid_git_ref(ref) || !valid_repo_path(path)) { error = "Invalid ref or path"; return {}; }
 
@@ -539,6 +570,7 @@ std::vector<TreeEntry> GitService::list_tree(const Repository& repo, const std::
 
 std::vector<CommitInfo> GitService::list_commits(const Repository& repo, const std::string& ref,
                                                  std::size_t limit, std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     if (!repository_available(repo)) { error = "Repository is not available locally"; return {}; }
     if (!valid_git_ref(ref)) { error = "Invalid ref"; return {}; }
     limit = std::min<std::size_t>(limit, 500);
@@ -564,6 +596,7 @@ std::vector<CommitInfo> GitService::list_commits(const Repository& repo, const s
 BlobResult GitService::read_blob(const Repository& repo, const std::string& ref,
                                  const std::string& path, std::size_t max_bytes,
                                  std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     BlobResult blob;
     if (!repository_available(repo)) { error = "Repository is not available locally"; return blob; }
     if (!valid_git_ref(ref) || !valid_repo_path(path) || path.empty()) { error = "Invalid ref or path"; return blob; }
@@ -584,8 +617,65 @@ BlobResult GitService::read_blob(const Repository& repo, const std::string& ref,
     return blob;
 }
 
+BlobFileResult GitService::read_blob_file(const Repository& repo, const std::string& ref,
+                                          const std::string& path, std::size_t max_bytes,
+                                          std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
+    BlobFileResult blob;
+    if (!repository_available(repo)) {
+        error = "Repository is not available locally";
+        return blob;
+    }
+    if (!valid_git_ref(ref) || !valid_repo_path(path) || path.empty()) {
+        error = "Invalid ref or path";
+        return blob;
+    }
+    const std::string object = ref + ":" + path;
+    auto size_result = ProcessRunner::run(
+        git_args(repo, {"cat-file", "-s", object}), {}, &shutdown_requested_,
+        std::chrono::seconds(10));
+    if (size_result.exit_code != 0) {
+        error = process_error(size_result);
+        return blob;
+    }
+    blob.size = parse_uint(trim(size_result.output));
+    if (blob.size > max_bytes) {
+        blob.found = true;
+        blob.too_large = true;
+        return blob;
+    }
+
+    const auto output_path = temporary_output_path(repo, ".blob");
+    auto result = ProcessRunner::run_to_file(
+        git_args(repo, {"show", object}), output_path, max_bytes, {},
+        &shutdown_requested_, std::chrono::seconds(30), std::chrono::seconds(1));
+    if (result.output_too_large) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        blob.found = true;
+        blob.too_large = true;
+        return blob;
+    }
+    if (result.exit_code != 0) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        error = process_error(result);
+        return blob;
+    }
+
+    std::ifstream input(output_path, std::ios::binary);
+    std::string prefix(8192, '\0');
+    input.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+    prefix.resize(static_cast<std::size_t>(input.gcount()));
+    blob.found = true;
+    blob.binary = looks_binary(prefix);
+    blob.file = output_path;
+    return blob;
+}
+
 std::string GitService::show_commit(const Repository& repo, const std::string& oid,
                                     std::size_t max_bytes, std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     if (!repository_available(repo)) { error = "Repository is not available locally"; return {}; }
     if (!valid_git_ref(oid)) { error = "Invalid commit object"; return {}; }
     auto result = ProcessRunner::run(
@@ -598,37 +688,61 @@ std::string GitService::show_commit(const Repository& repo, const std::string& o
 
 ArchiveResult GitService::archive_ref(const Repository& repo, const std::string& ref,
                                       std::size_t max_bytes, std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     ArchiveResult archive;
     if (!repository_available(repo)) { error = "Repository is not available locally"; return archive; }
     if (!valid_git_ref(ref)) { error = "Invalid ref"; return archive; }
-    auto result = ProcessRunner::run(git_args(repo, {"archive", "--format=zip", "-9", ref}), {},
-                                     &shutdown_requested_,
-                                     std::chrono::minutes(10), std::chrono::seconds(1), max_bytes + 1);
-    if (result.exit_code != 0) { error = process_error(result); return archive; }
-    if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
+    const auto output_path = temporary_output_path(repo, ".zip");
+    auto result = ProcessRunner::run_to_file(
+        git_args(repo, {"archive", "--format=zip", "-9", ref}), output_path, max_bytes,
+        {}, &shutdown_requested_, std::chrono::minutes(10), std::chrono::seconds(1));
+    if (result.output_too_large) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        archive.too_large = true;
+        return archive;
+    }
+    if (result.exit_code != 0) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        error = process_error(result);
+        return archive;
+    }
     archive.found = true;
-    archive.size = result.output.size();
-    archive.data = std::move(result.output);
+    archive.size = std::filesystem::file_size(output_path);
+    archive.file = output_path;
     return archive;
 }
 
 ArchiveResult GitService::archive_bare_repository(const Repository& repo, std::size_t max_bytes,
                                                   std::string& error) const {
+    std::shared_lock guard(*repository_lock(repo.id));
     ArchiveResult archive;
     const auto path = repo_path(repo);
     if (!std::filesystem::is_directory(path)) { error = "Repository is not available locally"; return archive; }
     // Run from the parent directory and pass just the bare-repo's own directory name, so
     // the zip's internal paths are relative ("reponame.git/objects/...") instead of
     // leaking this host's absolute filesystem layout.
-    auto result = ProcessRunner::run({"zip", "-r", "-q", "-X", "-", path.filename().string()},
-                                     path.parent_path(), &shutdown_requested_,
-                                     std::chrono::minutes(10),
-                                     std::chrono::seconds(1), max_bytes + 1);
-    if (result.exit_code != 0) { error = process_error(result); return archive; }
-    if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
+    const auto output_path = temporary_output_path(repo, ".git.zip");
+    auto result = ProcessRunner::run_to_file(
+        {"zip", "-r", "-q", "-X", "-", path.filename().string()}, output_path,
+        max_bytes, path.parent_path(), &shutdown_requested_, std::chrono::minutes(10),
+        std::chrono::seconds(1));
+    if (result.output_too_large) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        archive.too_large = true;
+        return archive;
+    }
+    if (result.exit_code != 0) {
+        std::error_code ignored;
+        std::filesystem::remove(output_path, ignored);
+        error = process_error(result);
+        return archive;
+    }
     archive.found = true;
-    archive.size = result.output.size();
-    archive.data = std::move(result.output);
+    archive.size = std::filesystem::file_size(output_path);
+    archive.file = output_path;
     return archive;
 }
 

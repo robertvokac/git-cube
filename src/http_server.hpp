@@ -3,12 +3,15 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace gitcube {
@@ -23,10 +26,23 @@ struct HttpRequest {
 };
 
 struct HttpResponse {
+    HttpResponse() = default;
+    HttpResponse(int response_status, std::string response_content_type,
+                 std::string response_body,
+                 std::map<std::string, std::string> response_headers = {})
+        : status(response_status), content_type(std::move(response_content_type)),
+          body(std::move(response_body)), headers(std::move(response_headers)) {}
+
     int status = 200;
     std::string content_type = "text/html; charset=utf-8";
     std::string body;
     std::map<std::string, std::string> headers;
+    std::filesystem::path body_file;
+    bool remove_body_file = false;
+    int send_timeout_seconds = 30;
+    // Keeps application-owned resources (for example an export semaphore lease) alive
+    // until the response has been fully sent or abandoned.
+    std::shared_ptr<void> lifetime_guard;
 
     static HttpResponse redirect(std::string location, int status = 303);
     static HttpResponse text(std::string body, int status = 200);

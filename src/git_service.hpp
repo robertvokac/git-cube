@@ -6,8 +6,12 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gitcube {
@@ -61,10 +65,18 @@ struct BlobResult {
     std::uintmax_t size = 0;
 };
 
+struct BlobFileResult {
+    bool found = false;
+    bool too_large = false;
+    bool binary = false;
+    std::filesystem::path file;
+    std::uintmax_t size = 0;
+};
+
 struct ArchiveResult {
     bool found = false;
     bool too_large = false;
-    std::string data;
+    std::filesystem::path file;
     std::uintmax_t size = 0;
 };
 
@@ -83,6 +95,9 @@ public:
     BlobResult read_blob(const Repository& repo, const std::string& ref,
                          const std::string& path, std::size_t max_bytes,
                          std::string& error) const;
+    BlobFileResult read_blob_file(const Repository& repo, const std::string& ref,
+                                  const std::string& path, std::size_t max_bytes,
+                                  std::string& error) const;
     std::string show_commit(const Repository& repo, const std::string& oid,
                             std::size_t max_bytes, std::string& error) const;
     // Zips the tree contents of `ref` (git archive) — just the files, as they'd appear
@@ -98,8 +113,15 @@ private:
     std::filesystem::path data_dir_;
     Database& database_;
     const std::atomic<bool>& shutdown_requested_;
+    mutable std::mutex repository_locks_mutex_;
+    mutable std::unordered_map<std::int64_t, std::shared_ptr<std::shared_mutex>>
+        repository_locks_;
+    mutable std::atomic<std::uint64_t> temporary_file_counter_{0};
 
     std::filesystem::path repo_path(const Repository& repo) const;
+    std::filesystem::path temporary_output_path(const Repository& repo,
+                                                std::string_view suffix) const;
+    std::shared_ptr<std::shared_mutex> repository_lock(std::int64_t repo_id) const;
     std::vector<std::string> git_args(const Repository& repo,
                                       std::initializer_list<std::string> args) const;
     JobExecutionResult clone_repository(const Job& job, const Repository& repo);

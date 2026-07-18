@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,6 +35,7 @@ private:
     std::atomic<bool>& shutdown_requested_;
     Database database_;
     GitService git_;
+    std::binary_semaphore archive_slot_{1};
     std::unique_ptr<HttpServer> server_;
     std::vector<std::thread> workers_;
     std::condition_variable work_cv_;
@@ -57,7 +59,7 @@ private:
     HttpResponse commits_page(std::int64_t id, const HttpRequest& request);
     HttpResponse commit_page(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_ref_download(std::int64_t id, const HttpRequest& request);
-    HttpResponse archive_git_download(std::int64_t id);
+    HttpResponse archive_git_download(std::int64_t id, const HttpRequest& request);
     HttpResponse api_status();
     HttpResponse check_repo_api(const HttpRequest& request);
 
@@ -70,6 +72,7 @@ private:
     std::string action_form(std::string_view action, std::string_view label,
                             std::string_view css = "") const;
     bool valid_csrf(const HttpRequest& request) const;
+    std::shared_ptr<void> try_acquire_archive_slot();
 };
 
 } // namespace gitcube

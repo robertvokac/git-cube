@@ -192,9 +192,11 @@ The repository detail page's **Export** row offers two downloads:
   it sits on disk (refs, objects, packs — everything needed to re-clone it, no
   worktree). Extract it and `git clone path/to/extracted.git` works.
 
-Both are fully buffered in memory before being sent (this server has no chunked/
-streaming response support yet) and capped at 500 MiB; a repository larger than that
-will fail the export with a 413 rather than exhaust memory.
+Both are generated into an owner-only temporary file and streamed to the client, capped
+at 500 MiB. Only one export may run at a time; another request receives 503 until the
+current generation/download finishes. Export forms use CSRF-protected POST requests.
+Temporary files are removed after sending, on disconnect, and during the next startup
+after a hard crash.
 
 ### Jobs
 
@@ -231,7 +233,8 @@ Press **Ctrl+C** in the terminal running GitCube, or send it `SIGTERM` (e.g. `ki
    after that it sends `SIGTERM`, then `SIGKILL` five seconds later if still alive.
 3. Returns the interrupted job to the queue (not a permanent failure) so it retries
    automatically after restart.
-4. Cleans up any orphaned partial-clone directory left in `data/tmp` on the next start.
+4. Cleans up orphaned partial-clone directories and streamed-export files left in
+   `data/tmp` on the next start.
 
 Avoid `kill -9` and closing the terminal without Ctrl+C first (that sends `SIGHUP`,
 which isn't handled) — neither is catastrophic (the next start recovers), but neither
@@ -307,9 +310,10 @@ expected to be fast local reads, not network operations.
 ```text
 data/
 ├── gitcube.sqlite3          # WAL mode; repositories, jobs, refs, releases, schema_migrations
+├── gitcube.lock             # held exclusively for the lifetime of the process
 ├── repositories/
 │   └── github.com/openeggbert/cna.git/   # bare mirror, no worktree
-├── tmp/                      # clone staging: clone-<repo id>-<job id>.git
+├── tmp/                      # atomic clone staging and short-lived streamed exports
 ├── cache/
 └── logs/
 ```
@@ -411,8 +415,8 @@ The library target (`gitcube_core`) builds with `-Wall -Wextra -Wpedantic -Wconv
 - No full-text code search, pull requests, issues or GitHub Actions synchronization.
 - No per-running-job cancel button — pausing affects future/queued jobs, not a child
   process already running.
-- Zip export is fully buffered in memory (no streaming response support), capped at
-  500 MiB.
+- Zip export is capped at 500 MiB and serialized globally; there is no resumable/range
+  download support yet.
 
 ## License
 
