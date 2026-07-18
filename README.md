@@ -383,6 +383,11 @@ already-released one, and never touch the CREATE TABLE block. After migrations r
 letting a mismatch surface later as a cryptic "no such column" from whichever query
 happens to run first.
 
+Database calls borrow thread-safe SQLite connections from a process-local pool instead
+of reopening the file and reapplying persistent PRAGMAs on every operation. At most 32
+idle connections are retained; excess concurrent connections close when returned, so
+the optimization cannot turn a temporary traffic spike into an unbounded RAM cache.
+
 ### Security model
 
 - GitCube binds to `127.0.0.1` by default and has no authentication — treat it as a

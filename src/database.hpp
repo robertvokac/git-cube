@@ -4,11 +4,14 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace gitcube {
+
+struct DatabaseConnectionPool;
 
 struct Repository {
     std::int64_t id = 0;
@@ -118,6 +121,9 @@ struct JobPage {
 class Database {
 public:
     explicit Database(std::filesystem::path path);
+    ~Database();
+    Database(const Database&) = delete;
+    Database& operator=(const Database&) = delete;
 
     void initialize();
     void recover_interrupted_jobs();
@@ -179,6 +185,7 @@ public:
 
 private:
     std::filesystem::path path_;
+    std::shared_ptr<DatabaseConnectionPool> pool_;
 };
 
 } // namespace gitcube

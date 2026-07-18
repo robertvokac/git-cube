@@ -18,7 +18,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <sys/socket.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace gitcube {
 struct HttpServerTestAccess {
@@ -544,6 +546,33 @@ ALTER TABLE repositories DROP COLUMN canonical_url;
         metadata_error_filter.status = "error";
         require(db.list_repositories_page(metadata_error_filter, 1, 25).total == 1,
                 "Repository filtering must include metadata state");
+
+        std::atomic<bool> concurrent_database_failure{false};
+        std::vector<std::thread> database_threads;
+        for (int worker = 0; worker < 8; ++worker) {
+            database_threads.emplace_back([&, worker] {
+                try {
+                    for (int iteration = 0; iteration < 40; ++iteration) {
+                        if ((worker % 2) == 0) {
+                            const auto concurrent_repo =
+                                db.get_repository(added.id);
+                            if (!concurrent_repo ||
+                                db.list_repositories_page({}, 1, 25).total != 1) {
+                                concurrent_database_failure.store(true);
+                            }
+                        } else if (!db.set_repository_importance(
+                                       added.id, iteration % 4)) {
+                            concurrent_database_failure.store(true);
+                        }
+                    }
+                } catch (...) {
+                    concurrent_database_failure.store(true);
+                }
+            });
+        }
+        for (auto& thread : database_threads) thread.join();
+        require(!concurrent_database_failure.load(),
+                "Pooled SQLite connections failed under concurrent reads and writes");
 
         db.update_repository_health(added.id, "healthy", "");
         repository_state = db.get_repository(added.id);

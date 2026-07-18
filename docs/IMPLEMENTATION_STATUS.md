@@ -52,6 +52,10 @@ ports, DNS spelling and percent encoding; GitHub URL aliases/case map to one ind
 canonical key. New mirrors live under `repositories/by-id/<id>.git`, eliminating the
 lossy filename-sanitization collisions while preserving every legacy storage path.
 
+**SQLite connection reuse** — database calls use a thread-safe process-local connection
+pool instead of reopening SQLite and reapplying WAL configuration for every operation.
+The pool retains at most 32 idle handles and has a concurrent read/write regression test.
+
 **Continuous integration** — GitHub Actions blocks on GCC Debug/Release, Clang Debug,
 warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake exposes
 dedicated warnings/sanitizer/coverage options, all CI builds are capped at two parallel
@@ -103,8 +107,6 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
 
 - Dynamic HTML/JSON responses are still buffered, but large raw blobs and ZIP exports
   now use bounded temporary files streamed by `http_server.cpp`.
-- SQLite: a fresh `Connection` (and its `PRAGMA` setup) is opened per call rather than
-  reused; fine at today's scale, a real cost under heavier concurrent load.
 - Repo-browsing routes (tree/blob/commits/archive) run `git` synchronously on the
   HTTP request thread rather than going through the job queue — acceptable because
   they're local reads, but they do block that connection's thread for their duration.

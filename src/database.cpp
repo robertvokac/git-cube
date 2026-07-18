@@ -3,6 +3,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -95,7 +96,6 @@ public:
         }
         sqlite3_busy_timeout(db_, 10000);
         exec("PRAGMA foreign_keys=ON;");
-        exec("PRAGMA journal_mode=WAL;");
         exec("PRAGMA synchronous=NORMAL;");
     }
 
@@ -366,11 +366,68 @@ std::string repository_storage_path(std::int64_t id) {
 
 } // namespace
 
-Database::Database(std::filesystem::path path) : path_(std::move(path)) {}
+struct DatabaseConnectionPool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<Connection>> idle;
+};
+
+namespace {
+
+constexpr std::size_t kMaxIdleDatabaseConnections = 32;
+
+class ConnectionLease {
+public:
+    ConnectionLease(std::shared_ptr<DatabaseConnectionPool> pool,
+                    const std::filesystem::path& path)
+        : pool_(std::move(pool)) {
+        {
+            std::lock_guard lock(pool_->mutex);
+            if (!pool_->idle.empty()) {
+                connection_ = std::move(pool_->idle.back());
+                pool_->idle.pop_back();
+            }
+        }
+        if (!connection_) connection_ = std::make_unique<Connection>(path);
+    }
+
+    ~ConnectionLease() {
+        if (!connection_) return;
+        try {
+            std::lock_guard lock(pool_->mutex);
+            if (pool_->idle.size() < kMaxIdleDatabaseConnections) {
+                pool_->idle.push_back(std::move(connection_));
+            }
+        } catch (...) {
+            // Pool reuse is an optimization. If retaining a connection cannot allocate,
+            // destroying it is safe and keeps cleanup noexcept.
+        }
+    }
+
+    ConnectionLease(const ConnectionLease&) = delete;
+    ConnectionLease& operator=(const ConnectionLease&) = delete;
+
+    Connection& connection() const { return *connection_; }
+    sqlite3* get() const { return connection_->get(); }
+    void exec(const std::string& sql) const { connection_->exec(sql); }
+
+private:
+    std::shared_ptr<DatabaseConnectionPool> pool_;
+    std::unique_ptr<Connection> connection_;
+};
+
+} // namespace
+
+Database::Database(std::filesystem::path path)
+    : path_(std::move(path)), pool_(std::make_shared<DatabaseConnectionPool>()) {}
+
+Database::~Database() = default;
 
 void Database::initialize() {
     std::filesystem::create_directories(path_.parent_path());
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
+    // WAL is persistent database state, so set it once during initialization rather
+    // than re-running the pragma for every pooled connection.
+    db.exec("PRAGMA journal_mode=WAL;");
     // Frozen v1 schema — do not add columns here. See the kMigrations comment above:
     // every column added since v1 belongs exclusively in that list.
     db.exec(R"SQL(
@@ -462,13 +519,13 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime(
     // The block above only creates tables that don't exist yet, so on an existing
     // database file it's a no-op even when the schema it describes has moved on since
     // that file was created. Bring such a database up to date explicitly.
-    run_pending_migrations(db);
-    verify_schema(db);
-    backfill_canonical_repository_urls(db);
+    run_pending_migrations(db.connection());
+    verify_schema(db.connection());
+    backfill_canonical_repository_urls(db.connection());
 }
 
 void Database::recover_interrupted_jobs() {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         db.exec("UPDATE jobs SET status='queued', started_at='', finished_at='', error='Recovered after GitCube shutdown', message='Recovered interrupted job' WHERE status='running';");
@@ -481,7 +538,7 @@ void Database::recover_interrupted_jobs() {
 }
 
 AddRepositoryResult Database::add_repository(const ParsedRepositoryUrl& parsed) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         std::optional<std::int64_t> existing_id;
@@ -534,7 +591,7 @@ INSERT INTO repositories(
 std::vector<ImportedRepository> Database::import_repositories(const std::vector<ParsedRepositoryUrl>& parsed_urls) {
     std::vector<ImportedRepository> results;
     results.reserve(parsed_urls.size());
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         Statement existing(db.get(),
@@ -592,7 +649,7 @@ INSERT INTO repositories(
 }
 
 std::vector<Repository> Database::list_repositories() const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), std::string("SELECT ") + repository_columns +
         " FROM repositories ORDER BY host COLLATE NOCASE, owner COLLATE NOCASE, name COLLATE NOCASE");
     std::vector<Repository> result;
@@ -627,7 +684,7 @@ void bind_repository_filter(Statement& stmt, const RepositoryFilter& filter) {
 
 RepositoryPage Database::list_repositories_page(const RepositoryFilter& filter, std::size_t page,
                                                 std::size_t per_page) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement count_stmt(db.get(), std::string("SELECT count(*) FROM repositories ") + kRepositoryFilterWhere);
     bind_repository_filter(count_stmt, filter);
     RepositoryPage result;
@@ -647,7 +704,7 @@ RepositoryPage Database::list_repositories_page(const RepositoryFilter& filter, 
 }
 
 std::optional<Repository> Database::get_repository(std::int64_t id) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), std::string("SELECT ") + repository_columns + " FROM repositories WHERE id=?");
     stmt.bind(1, id);
     if (!stmt.step_row()) return std::nullopt;
@@ -655,7 +712,7 @@ std::optional<Repository> Database::get_repository(std::int64_t id) const {
 }
 
 std::optional<Repository> Database::get_repository_by_url(const std::string& normalized_url) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), std::string("SELECT ") + repository_columns +
         " FROM repositories WHERE canonical_url=? OR normalized_url=? ORDER BY id LIMIT 1");
     stmt.bind(1, normalized_url);
@@ -665,7 +722,7 @@ std::optional<Repository> Database::get_repository_by_url(const std::string& nor
 }
 
 bool Database::set_repository_paused(std::int64_t id, bool paused) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET paused=?, modified_at=? WHERE id=?");
     stmt.bind(1, paused ? 1 : 0);
     stmt.bind(2, now_utc());
@@ -675,7 +732,7 @@ bool Database::set_repository_paused(std::int64_t id, bool paused) {
 }
 
 bool Database::set_repository_importance(std::int64_t id, int importance) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET importance=?, modified_at=? WHERE id=?");
     stmt.bind(1, importance);
     stmt.bind(2, now_utc());
@@ -685,7 +742,7 @@ bool Database::set_repository_importance(std::int64_t id, int importance) {
 }
 
 void Database::update_repository_status(std::int64_t id, const std::string& status, const std::string& error) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET status=?, last_error=?, modified_at=? WHERE id=?");
     stmt.bind(1, status);
     stmt.bind(2, error);
@@ -695,7 +752,7 @@ void Database::update_repository_status(std::int64_t id, const std::string& stat
 }
 
 void Database::set_repository_operation(std::int64_t id, const std::string& operation) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET operation=?, modified_at=? WHERE id=?");
     stmt.bind(1, operation);
     stmt.bind(2, now_utc());
@@ -707,7 +764,7 @@ void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector
                                               const std::string& default_branch, const std::string& head_oid,
                                               std::int64_t branches, std::int64_t tags, std::int64_t objects,
                                               bool fetched) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         Statement remove(db.get(), "DELETE FROM refs WHERE repo_id=?");
@@ -750,7 +807,7 @@ void Database::sync_repository_refs_and_stats(std::int64_t id, const std::vector
 
 void Database::update_repository_health(std::int64_t id, const std::string& health_status,
                                         const std::string& error) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET health_status=?, last_health_at=?, health_error=?, modified_at=? WHERE id=?");
     stmt.bind(1, health_status);
     const auto now = now_utc();
@@ -764,7 +821,7 @@ void Database::update_repository_health(std::int64_t id, const std::string& heal
 void Database::update_repository_metadata_status(std::int64_t id,
                                                  const std::string& metadata_status,
                                                  const std::string& error) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET metadata_status=?, metadata_error=?, modified_at=? WHERE id=?");
     stmt.bind(1, metadata_status);
     stmt.bind(2, error);
@@ -781,7 +838,7 @@ void Database::update_github_metadata(std::int64_t id, std::int64_t github_id,
                                       std::int64_t open_issues, const std::string& created_at,
                                       const std::string& updated_at, const std::string& pushed_at,
                                       const std::string& raw_json) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), R"SQL(
 UPDATE repositories SET github_repo_id=?, default_branch=CASE WHEN ?='' THEN default_branch ELSE ? END,
  description=?, homepage=?, html_url=?, license=?, archived=?, is_fork=?, stars=?, forks=?,
@@ -813,7 +870,7 @@ UPDATE repositories SET github_repo_id=?, default_branch=CASE WHEN ?='' THEN def
 
 bool Database::enqueue_job(std::optional<std::int64_t> repo_id, const std::string& type, const std::string& message,
                            const std::string& payload) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         const bool created = enqueue_job_locked(db.get(), repo_id, type, message, payload);
@@ -828,7 +885,7 @@ bool Database::enqueue_job(std::optional<std::int64_t> repo_id, const std::strin
 std::size_t Database::enqueue_all(const std::string& type) {
     const auto repositories = list_repositories();
     std::size_t count = 0;
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         for (const auto& repo : repositories) {
@@ -846,7 +903,7 @@ std::size_t Database::enqueue_all(const std::string& type) {
 }
 
 std::optional<Job> Database::claim_next_job() {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         Statement select(db.get(), R"SQL(
@@ -883,7 +940,7 @@ ORDER BY j.id LIMIT 1
 }
 
 void Database::finish_job(std::int64_t job_id, bool success, const std::string& output, const std::string& error) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         Statement stmt(db.get(), "UPDATE jobs SET status=?,finished_at=?,output=?,error=? WHERE id=?");
@@ -907,7 +964,7 @@ void Database::finish_job(std::int64_t job_id, bool success, const std::string& 
 }
 
 void Database::requeue_job(std::int64_t job_id, const std::string& message, int delay_seconds) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     // The delay is computed in SQL (datetime('now', '+N seconds')) rather than formatted
     // in C++, so it's guaranteed to use the exact same "YYYY-MM-DD HH:MM:SS" format that
     // claim_next_job compares scheduled_at against — now_utc() produces a different
@@ -936,7 +993,7 @@ void Database::requeue_job(std::int64_t job_id, const std::string& message, int 
 }
 
 void Database::delay_pending_github_jobs(int delay_seconds) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     // Called when one job discovers the GitHub API rate limit has been hit, so every
     // other job that would otherwise immediately retry the same exhausted quota backs
     // off too, instead of each independently burning an attempt to rediscover it.
@@ -949,7 +1006,7 @@ void Database::delay_pending_github_jobs(int delay_seconds) {
 }
 
 void Database::update_job_message(std::int64_t job_id, const std::string& message) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE jobs SET message=? WHERE id=?");
     stmt.bind(1, message);
     stmt.bind(2, job_id);
@@ -957,7 +1014,7 @@ void Database::update_job_message(std::int64_t job_id, const std::string& messag
 }
 
 JobPage Database::recent_jobs_page(const std::string& status_filter, std::size_t page, std::size_t per_page) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement count_stmt(db.get(), "SELECT count(*) FROM jobs WHERE ?1 = '' OR status = ?1");
     count_stmt.bind(1, status_filter);
     JobPage result;
@@ -979,19 +1036,19 @@ ORDER BY id DESC LIMIT ?2 OFFSET ?3
 }
 
 std::int64_t Database::active_job_count() const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "SELECT count(*) FROM jobs WHERE status='running'");
     return stmt.step_row() ? stmt.integer(0) : 0;
 }
 
 std::int64_t Database::queued_job_count() const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "SELECT count(*) FROM jobs WHERE status='queued'");
     return stmt.step_row() ? stmt.integer(0) : 0;
 }
 
 std::vector<RefRecord> Database::list_refs(std::int64_t repo_id, const std::string& type) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     const std::string sql = type.empty()
         ? "SELECT type,name,target_oid FROM refs WHERE repo_id=? ORDER BY type,name COLLATE NOCASE"
         : "SELECT type,name,target_oid FROM refs WHERE repo_id=? AND type=? ORDER BY name COLLATE NOCASE";
@@ -1004,7 +1061,7 @@ std::vector<RefRecord> Database::list_refs(std::int64_t repo_id, const std::stri
 }
 
 void Database::replace_releases(std::int64_t repo_id, const std::vector<ReleaseRecord>& releases) {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
         Statement remove(db.get(), "DELETE FROM releases WHERE repo_id=?");
@@ -1031,7 +1088,7 @@ void Database::replace_releases(std::int64_t repo_id, const std::vector<ReleaseR
 }
 
 std::vector<ReleaseRecord> Database::list_releases(std::int64_t repo_id) const {
-    Connection db(path_);
+    ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "SELECT github_id,tag_name,name,html_url,published_at,prerelease,draft FROM releases WHERE repo_id=? ORDER BY published_at DESC");
     stmt.bind(1, repo_id);
     std::vector<ReleaseRecord> releases;
