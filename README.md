@@ -268,7 +268,7 @@ them depend on a web framework or ORM:
 | `git_service.hpp/.cpp` | Every `git`/`curl` invocation: clone, fetch, health check, GitHub metadata, GitHub account listing, tree/blob/commit/archive reads. Takes a `Job` or `Repository`, never an `HttpRequest`. |
 | `database.hpp/.cpp` | The only file that touches SQLite. Schema, migrations, and every query, wrapped around a tiny RAII `Connection`/`Statement` pair (not a public API — see below). |
 | `http_server.hpp/.cpp` | The HTTP/1.1 server itself: POSIX sockets, request parsing, thread-per-connection with a concurrency cap, response headers (CSP etc.). Knows nothing about GitCube's routes. |
-| `process.hpp/.cpp` | `fork`/`exec`/`waitpid` wrapper used for every child process, with output capture, a timeout, and graceful-shutdown-aware termination. |
+| `process.hpp/.cpp` | `posix_spawnp`/`waitpid` wrapper used for every child process, with separate stdout/stderr capture, a timeout, and graceful-shutdown-aware process-group termination. |
 | `json.hpp/.cpp` | A small recursive-descent JSON parser (with a nesting-depth cap) used to read GitHub API responses. Not a general-purpose library. |
 | `util.hpp/.cpp` | URL/repository-URL parsing and validation, HTML/JSON/URL escaping, the Markdown renderer, ref/path validation. |
 | `favicon_assets.hpp/.cpp` | The favicon (SVG text + ICO/PNG bytes) embedded as C++ constants; see `docs/favicon/`. |
@@ -355,9 +355,12 @@ happens to run first.
   address without putting real authentication and TLS in front of it.
 - Every POST requires a per-process CSRF token embedded in the page (checked in
   `Application::valid_csrf`).
-- `git`/`curl`/`zip` are invoked with `execvp` and an argument array — **never** through
+- `git`/`curl`/`zip` are invoked with `posix_spawnp` and an argument array — **never** through
   a shell, so there's no shell-metacharacter injection surface regardless of what a
   repository URL, ref name or file path contains.
+- Child processes receive a controlled environment: global/system Git configuration,
+  credential helpers, Git prompting, `.curlrc`, and `ZIPOPT` cannot silently change the
+  public-HTTP-only behavior or corrupt binary output.
 - Repository URLs are restricted to public `http://`/`https://`, with credentials and
   any other scheme rejected at parse time (`parse_repository_url` in `util.cpp`).
 - Ref names and repository-relative paths are validated (`valid_git_ref`,

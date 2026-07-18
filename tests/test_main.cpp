@@ -1,8 +1,12 @@
 #include "data_directory_lock.hpp"
 #include "database.hpp"
 #include "json.hpp"
+#include "process.hpp"
 #include "util.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
@@ -58,6 +62,49 @@ int main() {
         {
             gitcube::DataDirectoryLock lock_after_release(temp);
         }
+
+        const auto printed = gitcube::ProcessRunner::run({"/usr/bin/printf", "hello"});
+        require(printed.exit_code == 0 && printed.output == "hello",
+                "Process stdout capture failed");
+        require(printed.error_output.empty(), "Process stderr should be separate");
+        const auto large_output =
+            gitcube::ProcessRunner::run({"/usr/bin/seq", "1", "100000"});
+        require(large_output.exit_code == 0 &&
+                    large_output.output.find("100000\n") != std::string::npos,
+                "Large process output was truncated by a nonblocking child pipe");
+
+        const auto missing = gitcube::ProcessRunner::run(
+            {"/bin/ls", "/gitcube-path-that-must-not-exist"});
+        require(missing.exit_code != 0 && !missing.error_output.empty(),
+                "Process stderr capture failed");
+
+        const auto changed_directory = gitcube::ProcessRunner::run({"/bin/pwd"}, temp);
+        require(changed_directory.exit_code == 0 &&
+                    gitcube::trim(changed_directory.output) == temp.string(),
+                "Process working directory failed");
+
+        setenv("GIT_TEST_SECRET", "must-not-leak", 1);
+        setenv("ZIPOPT", "-9", 1);
+        const auto environment = gitcube::ProcessRunner::run({"/usr/bin/env"});
+        require(environment.output.find("GIT_TEST_SECRET=") == std::string::npos,
+                "Git environment variables must not leak to children");
+        require(environment.output.find("ZIPOPT=-9") == std::string::npos,
+                "ZIPOPT must not leak to children");
+        require(environment.output.find("GIT_CONFIG_NOSYSTEM=1") != std::string::npos,
+                "Controlled Git environment is missing");
+        unsetenv("GIT_TEST_SECRET");
+        unsetenv("ZIPOPT");
+
+        const auto timeout_started = std::chrono::steady_clock::now();
+        const auto timed_out = gitcube::ProcessRunner::run(
+            {"/bin/sleep", "30"}, {}, nullptr, std::chrono::seconds(1),
+            std::chrono::seconds(1));
+        const auto timeout_duration = std::chrono::steady_clock::now() - timeout_started;
+        require(timed_out.timed_out && timed_out.exit_code != 0,
+                "Process timeout did not terminate the child");
+        require(timeout_duration < std::chrono::seconds(8),
+                "Timed-out child was not terminated promptly");
+
         gitcube::Database db(temp / "gitcube.sqlite3");
         db.initialize();
         const auto added = db.add_repository(*github);

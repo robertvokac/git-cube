@@ -42,6 +42,20 @@ JobExecutionResult requeue_result(std::string output, std::string_view reason, i
     return result;
 }
 
+std::string process_output(ProcessResult result) {
+    if (!result.error_output.empty()) {
+        if (!result.output.empty() && result.output.back() != '\n') result.output.push_back('\n');
+        result.output += result.error_output;
+    }
+    return std::move(result.output);
+}
+
+std::string process_error(const ProcessResult& result) {
+    if (result.error_output.empty()) return trim(result.output);
+    if (result.output.empty()) return trim(result.error_output);
+    return trim(result.output + "\n" + result.error_output);
+}
+
 // GitHub returns this shape (HTTP 403, or 429 for the secondary/abuse limit) when the
 // caller has exhausted its request quota; unauthenticated requests are capped at 60/hour
 // per IP, which a bulk account import (one metadata fetch per repository) can exhaust
@@ -53,7 +67,8 @@ constexpr int kGitHubRateLimitBackoffSeconds = 15 * 60;
 
 GitHubApiResult GitService::github_api_get(const std::string& url) const {
     auto result = ProcessRunner::run(
-        {"curl", "--silent", "--show-error", "--location", "--max-time", "30",
+        {"curl", "--disable", "--silent", "--show-error", "--location",
+         "--proto", "=https", "--proto-redir", "=https", "--max-time", "30",
          "--header", "Accept: application/vnd.github+json",
          "--header", "X-GitHub-Api-Version: 2022-11-28",
          "--user-agent", "GitCube/0.1", "--write-out", "\n%{http_code}", url},
@@ -63,6 +78,10 @@ GitHubApiResult GitService::github_api_get(const std::string& url) const {
     api.interrupted = result.interrupted;
     api.curl_exit_code = result.exit_code;
     api.body = std::move(result.output);
+    if (api.curl_exit_code != 0 && !result.error_output.empty()) {
+        if (!api.body.empty() && api.body.back() != '\n') api.body.push_back('\n');
+        api.body += result.error_output;
+    }
     if (api.curl_exit_code == 0) {
         const auto nl = api.body.rfind('\n');
         if (nl != std::string::npos) {
@@ -108,7 +127,10 @@ std::filesystem::path GitService::repo_path(const Repository& repo) const {
 
 std::vector<std::string> GitService::git_args(const Repository& repo,
                                               std::initializer_list<std::string> args) const {
-    std::vector<std::string> result{"git", "--git-dir", repo_path(repo).string()};
+    std::vector<std::string> result{
+        "git", "-c", "credential.helper=", "-c", "core.askPass=",
+        "--git-dir", repo_path(repo).string()
+    };
     result.insert(result.end(), args.begin(), args.end());
     return result;
 }
@@ -117,7 +139,8 @@ bool GitService::repository_available(const Repository& repo) const {
     const auto path = repo_path(repo);
     if (!std::filesystem::is_directory(path)) return false;
     const auto result = ProcessRunner::run(
-        {"git", "--git-dir", path.string(), "rev-parse", "--is-bare-repository"}, {}, nullptr,
+        {"git", "-c", "credential.helper=", "-c", "core.askPass=", "--git-dir",
+         path.string(), "rev-parse", "--is-bare-repository"}, {}, nullptr,
         std::chrono::seconds(10));
     return result.exit_code == 0 && trim(result.output) == "true";
 }
@@ -156,27 +179,32 @@ JobExecutionResult GitService::clone_repository(const Job& job, const Repository
     std::filesystem::create_directories(target.parent_path());
 
     auto result = ProcessRunner::run(
-        {"git", "clone", "--mirror", "--progress", "--", repo.normalized_url, temp.string()}, {},
+        {"git", "-c", "credential.helper=", "-c", "core.askPass=", "clone", "--mirror",
+         "--progress", "--", repo.normalized_url, temp.string()}, {},
         &shutdown_requested_, std::chrono::seconds::zero());
     if (result.interrupted) {
         std::filesystem::remove_all(temp, ec);
-        return requeue_result(std::move(result.output), "Clone interrupted by shutdown; job requeued");
+        return requeue_result(process_output(std::move(result)),
+                              "Clone interrupted by shutdown; job requeued");
     }
     if (result.exit_code != 0) {
+        const std::string output = process_output(std::move(result));
         std::filesystem::remove_all(temp, ec);
-        const std::string status = classify_git_failure(result.output);
-        database_.update_repository_status(repo.id, status, trim(result.output));
-        return {false, result.output, trim(result.output).empty() ? "git clone failed" : trim(result.output)};
+        const std::string status = classify_git_failure(output);
+        database_.update_repository_status(repo.id, status, trim(output));
+        return {false, output, trim(output).empty() ? "git clone failed" : trim(output)};
     }
 
     std::filesystem::rename(temp, target, ec);
     if (ec) {
         std::filesystem::remove_all(temp, ec);
         database_.update_repository_status(repo.id, "error", "Cannot move completed mirror into place");
-        return {false, result.output, "Cannot move completed mirror into place: " + ec.message()};
+        return {false, process_output(std::move(result)),
+                "Cannot move completed mirror into place: " + ec.message()};
     }
 
-    auto synchronized = synchronize_repository_state(repo, false, std::move(result.output));
+    auto synchronized =
+        synchronize_repository_state(repo, false, process_output(std::move(result)));
     if (synchronized.success && repo.github && repo.metadata_fetched_at.empty()) {
         database_.enqueue_job(repo.id, "metadata", "Read public GitHub metadata and releases");
     }
@@ -194,14 +222,16 @@ JobExecutionResult GitService::fetch_repository(const Job& job, const Repository
         git_args(repo, {"fetch", "--all", "--prune", "--prune-tags", "--force", "--tags", "--progress"}), {},
         &shutdown_requested_, std::chrono::seconds::zero());
     if (result.interrupted) {
-        return requeue_result(std::move(result.output), "Fetch interrupted by shutdown; job requeued");
+        return requeue_result(process_output(std::move(result)),
+                              "Fetch interrupted by shutdown; job requeued");
     }
     if (result.exit_code != 0) {
-        const std::string status = classify_git_failure(result.output);
-        database_.update_repository_status(repo.id, status, trim(result.output));
-        return {false, result.output, trim(result.output).empty() ? "git fetch failed" : trim(result.output)};
+        const std::string output = process_output(std::move(result));
+        const std::string status = classify_git_failure(output);
+        database_.update_repository_status(repo.id, status, trim(output));
+        return {false, output, trim(output).empty() ? "git fetch failed" : trim(output)};
     }
-    return synchronize_repository_state(repo, true, std::move(result.output));
+    return synchronize_repository_state(repo, true, process_output(std::move(result)));
 }
 
 JobExecutionResult GitService::synchronize_repository_state(const Repository& repo, bool fetched,
@@ -210,8 +240,9 @@ JobExecutionResult GitService::synchronize_repository_state(const Repository& re
         git_args(repo, {"for-each-ref", "--format=%(refname)%09%(objectname)"}), {}, nullptr,
         std::chrono::seconds(30));
     if (refs_result.exit_code != 0) {
-        database_.update_repository_status(repo.id, "error", trim(refs_result.output));
-        return {false, prefix_output + refs_result.output, "Cannot enumerate refs"};
+        const std::string diagnostic = process_error(refs_result);
+        database_.update_repository_status(repo.id, "error", diagnostic);
+        return {false, prefix_output + diagnostic, "Cannot enumerate refs"};
     }
 
     std::vector<RefRecord> refs;
@@ -262,29 +293,39 @@ JobExecutionResult GitService::health_repository(const Job& job, const Repositor
     database_.update_repository_status(repo.id, "checking");
     database_.update_job_message(job.id, "Checking remote availability and local object integrity");
 
-    auto remote = ProcessRunner::run({"git", "ls-remote", "--", repo.normalized_url}, {},
+    auto remote = ProcessRunner::run({"git", "-c", "credential.helper=", "-c",
+                                      "core.askPass=", "ls-remote", "--", repo.normalized_url}, {},
                                      &shutdown_requested_, std::chrono::seconds(90));
     if (remote.interrupted) {
-        return requeue_result(std::move(remote.output), "Health check interrupted by shutdown; job requeued");
+        return requeue_result(process_output(std::move(remote)),
+                              "Health check interrupted by shutdown; job requeued");
     }
     if (remote.exit_code != 0) {
-        const std::string status = classify_git_failure(remote.output);
-        database_.update_repository_status(repo.id, status, trim(remote.output));
-        return {false, remote.output, "Remote repository check failed"};
+        const std::string output = process_output(std::move(remote));
+        const std::string status = classify_git_failure(output);
+        database_.update_repository_status(repo.id, status, trim(output));
+        return {false, output, "Remote repository check failed"};
     }
     if (!repository_available(repo)) {
         database_.update_repository_status(repo.id, "error", "Local mirror is missing or invalid");
-        return {false, remote.output, "Local mirror is missing or invalid"};
+        return {false, process_output(std::move(remote)),
+                "Local mirror is missing or invalid"};
     }
 
     auto fsck = ProcessRunner::run(git_args(repo, {"fsck", "--full", "--no-dangling"}), {},
                                    &shutdown_requested_, std::chrono::minutes(30));
     if (fsck.interrupted) {
-        return requeue_result(remote.output + fsck.output, "Health check interrupted by shutdown; job requeued");
+        return requeue_result(process_output(std::move(remote)) +
+                                  process_output(std::move(fsck)),
+                              "Health check interrupted by shutdown; job requeued");
     }
     const bool healthy = fsck.exit_code == 0;
-    database_.update_repository_health(repo.id, healthy, healthy ? std::string{} : trim(fsck.output));
-    return {healthy, remote.output + fsck.output, healthy ? std::string{} : "git fsck reported errors"};
+    const std::string fsck_output = process_output(std::move(fsck));
+    const std::string remote_output = process_output(std::move(remote));
+    database_.update_repository_health(repo.id, healthy,
+                                       healthy ? std::string{} : trim(fsck_output));
+    return {healthy, remote_output + fsck_output,
+            healthy ? std::string{} : "git fsck reported errors"};
 }
 
 JobExecutionResult GitService::metadata_repository(const Job& job, const Repository& repo) {
@@ -458,7 +499,7 @@ std::vector<TreeEntry> GitService::list_tree(const Repository& repo, const std::
     if (!path.empty()) treeish += ":" + path;
     auto result = ProcessRunner::run(git_args(repo, {"ls-tree", "-z", "-l", treeish}), {}, nullptr,
                                      std::chrono::seconds(30), std::chrono::seconds(1), 16 * 1024 * 1024);
-    if (result.exit_code != 0) { error = trim(result.output); return {}; }
+    if (result.exit_code != 0) { error = process_error(result); return {}; }
 
     std::vector<TreeEntry> entries;
     std::size_t start = 0;
@@ -500,7 +541,7 @@ std::vector<CommitInfo> GitService::list_commits(const Repository& repo, const s
         git_args(repo, {"log", "-n", std::to_string(limit),
                         "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e", ref}), {}, nullptr,
         std::chrono::seconds(30), std::chrono::seconds(1), 16 * 1024 * 1024);
-    if (result.exit_code != 0) { error = trim(result.output); return {}; }
+    if (result.exit_code != 0) { error = process_error(result); return {}; }
     std::vector<CommitInfo> commits;
     for (const auto record : split_view(result.output, '\x1e')) {
         const auto value = trim(record);
@@ -523,12 +564,12 @@ BlobResult GitService::read_blob(const Repository& repo, const std::string& ref,
     const std::string object = ref + ":" + path;
     auto size_result = ProcessRunner::run(git_args(repo, {"cat-file", "-s", object}), {}, nullptr,
                                           std::chrono::seconds(10));
-    if (size_result.exit_code != 0) { error = trim(size_result.output); return blob; }
+    if (size_result.exit_code != 0) { error = process_error(size_result); return blob; }
     blob.size = parse_uint(trim(size_result.output));
     if (blob.size > max_bytes) { blob.found = true; blob.too_large = true; return blob; }
     auto result = ProcessRunner::run(git_args(repo, {"show", object}), {}, nullptr,
                                      std::chrono::seconds(30), std::chrono::seconds(1), max_bytes + 1);
-    if (result.exit_code != 0) { error = trim(result.output); return blob; }
+    if (result.exit_code != 0) { error = process_error(result); return blob; }
     blob.found = true;
     blob.data = std::move(result.output);
     blob.binary = looks_binary(blob.data);
@@ -542,7 +583,7 @@ std::string GitService::show_commit(const Repository& repo, const std::string& o
     auto result = ProcessRunner::run(
         git_args(repo, {"show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", oid}), {}, nullptr,
         std::chrono::seconds(60), std::chrono::seconds(1), max_bytes);
-    if (result.exit_code != 0) { error = trim(result.output); return {}; }
+    if (result.exit_code != 0) { error = process_error(result); return {}; }
     return result.output;
 }
 
@@ -553,7 +594,7 @@ ArchiveResult GitService::archive_ref(const Repository& repo, const std::string&
     if (!valid_git_ref(ref)) { error = "Invalid ref"; return archive; }
     auto result = ProcessRunner::run(git_args(repo, {"archive", "--format=zip", "-9", ref}), {}, nullptr,
                                      std::chrono::minutes(10), std::chrono::seconds(1), max_bytes + 1);
-    if (result.exit_code != 0) { error = trim(result.output); return archive; }
+    if (result.exit_code != 0) { error = process_error(result); return archive; }
     if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
     archive.found = true;
     archive.size = result.output.size();
@@ -572,7 +613,7 @@ ArchiveResult GitService::archive_bare_repository(const Repository& repo, std::s
     auto result = ProcessRunner::run({"zip", "-r", "-q", "-X", "-", path.filename().string()},
                                      path.parent_path(), nullptr, std::chrono::minutes(10),
                                      std::chrono::seconds(1), max_bytes + 1);
-    if (result.exit_code != 0) { error = trim(result.output); return archive; }
+    if (result.exit_code != 0) { error = process_error(result); return archive; }
     if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
     archive.found = true;
     archive.size = result.output.size();
