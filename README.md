@@ -138,7 +138,10 @@ The home page (**Repositories**) lists every known repository, 25 per page, with
 - **Importance** — see below.
 
 Every open dashboard tab polls `/api/status` every two seconds to keep status badges and
-the active/queued job counters live, without a full page reload.
+the active/queued job counters live, without a full page reload. The request names only
+the repository IDs on the current 25-row page (with a server-side maximum of 100), and
+one pooled database operation returns both job counters and those lightweight states;
+polling cost therefore does not grow with the full repository catalog.
 
 Repository state is deliberately split into independent channels. A failed metadata
 refresh or remote health check cannot make an otherwise valid local mirror stop being
@@ -174,6 +177,10 @@ description) if applicable, its releases, and:
   disk, or a previous clone failed).
 - The **Importance** selector described above.
 - The **Export** controls described below.
+
+To keep a single response bounded even for repositories with extreme history, the
+detail page renders at most 500 branches, 500 tags and the 200 latest GitHub releases.
+The complete ref/release data remains stored and is refreshed normally.
 
 ### Browsing files, commits and Markdown
 

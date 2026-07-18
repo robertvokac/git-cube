@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <iostream>
 #include <random>
 #include <regex>
@@ -17,6 +18,9 @@ namespace {
 // ZIP archives are spooled to an owner-only temporary file and streamed by HttpServer.
 // The cap bounds disk/network use and prevents an accidental multi-gigabyte export.
 constexpr std::size_t kMaxArchiveBytes = 500ULL * 1024 * 1024;
+constexpr std::size_t kMaxRenderedRefsPerType = 500;
+constexpr std::size_t kMaxRenderedReleases = 200;
+constexpr std::size_t kMaxStatusRepositoryIds = 100;
 
 std::string random_token() {
     std::random_device device;
@@ -29,6 +33,36 @@ std::string random_token() {
 
 std::optional<std::int64_t> parse_id(const std::smatch& match, std::size_t index = 1) {
     try { return std::stoll(match[index].str()); } catch (...) { return std::nullopt; }
+}
+
+std::optional<std::vector<std::int64_t>> parse_status_repository_ids(
+    std::string_view text) {
+    std::vector<std::int64_t> result;
+    if (text.empty()) return result;
+
+    std::size_t begin = 0;
+    std::size_t item_count = 0;
+    while (begin < text.size()) {
+        const std::size_t comma = text.find(',', begin);
+        const std::string_view item = text.substr(
+            begin, comma == std::string_view::npos ? text.size() - begin
+                                                   : comma - begin);
+        std::int64_t id = 0;
+        const auto [end, error] =
+            std::from_chars(item.data(), item.data() + item.size(), id);
+        if (item.empty() || error != std::errc{} ||
+            end != item.data() + item.size() || id <= 0 ||
+            ++item_count > kMaxStatusRepositoryIds) {
+            return std::nullopt;
+        }
+        if (std::find(result.begin(), result.end(), id) == result.end()) {
+            result.push_back(id);
+        }
+        if (comma == std::string_view::npos) break;
+        if (comma + 1 == text.size()) return std::nullopt;
+        begin = comma + 1;
+    }
+    return result;
 }
 
 std::string query_value(const HttpRequest& request, const std::string& key,
@@ -108,15 +142,26 @@ std::string importance_stars_html(int importance) {
     return out.str();
 }
 
-std::string display_status(const Repository& repository) {
-    if (!repository.operation.empty()) return repository.operation;
-    if (repository.status != "ready") return repository.status;
-    if (repository.health_status == "unhealthy" ||
-        repository.health_status == "remote-missing" ||
-        repository.health_status == "error") {
-        return repository.health_status;
+std::string display_status_values(const std::string& status,
+                                  const std::string& operation,
+                                  const std::string& health_status) {
+    if (!operation.empty()) return operation;
+    if (status != "ready") return status;
+    if (health_status == "unhealthy" || health_status == "remote-missing" ||
+        health_status == "error") {
+        return health_status;
     }
-    return repository.status;
+    return status;
+}
+
+std::string display_status(const Repository& repository) {
+    return display_status_values(repository.status, repository.operation,
+                                 repository.health_status);
+}
+
+std::string display_status(const RepositoryLiveStatus& repository) {
+    return display_status_values(repository.status, repository.operation,
+                                 repository.health_status);
 }
 
 std::string display_error(const Repository& repository) {
@@ -269,7 +314,9 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/") return dashboard(request);
     if (request.method == "GET" && request.path == "/add") return add_repositories_page();
     if (request.method == "GET" && request.path == "/jobs") return jobs_page(request);
-    if (request.method == "GET" && request.path == "/api/status") return api_status();
+    if (request.method == "GET" && request.path == "/api/status") {
+        return api_status(request);
+    }
     if (request.method == "GET" && request.path == "/api/check-repo") return check_repo_api(request);
     if (request.method == "GET" && request.path == "/favicon.svg") {
         return {200, "image/svg+xml", std::string(kFaviconSvg), {{"Cache-Control", "public, max-age=604800"}}};
@@ -370,6 +417,7 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     try { page_number = std::max<std::size_t>(1, std::stoull(query_value(request, "page", "1"))); } catch (...) {}
     constexpr std::size_t per_page = 25;
     const auto listing = database_.list_repositories_page(filter, page_number, per_page);
+    const auto job_status = database_.dashboard_status({});
     const std::size_t page_count = listing.total == 0 ? 1 : (listing.total + per_page - 1) / per_page;
     page_number = std::min(page_number, page_count);
 
@@ -378,8 +426,8 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     if (!error.empty()) body << "<section class=\"error\">" << html_escape(error) << "</section>";
     body << "<div class=\"grid\"><div class=\"stat\"><span class=\"muted\">Repositories</span><b>" << listing.total
          << "</b></div><div class=\"stat\"><span class=\"muted\">Active jobs</span><b id=\"active-count\">"
-         << database_.active_job_count() << "</b></div><div class=\"stat\"><span class=\"muted\">Queued jobs</span><b id=\"queued-count\">"
-         << database_.queued_job_count() << "</b></div></div>";
+         << job_status.active_jobs << "</b></div><div class=\"stat\"><span class=\"muted\">Queued jobs</span><b id=\"queued-count\">"
+         << job_status.queued_jobs << "</b></div></div>";
 
     body << "<section><div class=\"repo-header\"><div><h2>Repositories</h2><p class=\"muted\">Paused repositories are skipped by bulk operations and workers.</p></div><div class=\"actions\">"
          << action_form("/fetch-all", "Fetch all") << action_form("/health-all", "Check all", "secondary") << "</div></div>";
@@ -450,8 +498,13 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     }
     body << "</section>";
 
-    body << R"HTML(<script>
-setInterval(async()=>{try{const r=await fetch('/api/status');if(!r.ok)return;const d=await r.json();
+    body << "<script>const gitcubeStatusUrl='/api/status?ids=";
+    for (std::size_t index = 0; index < listing.items.size(); ++index) {
+        if (index != 0) body << ',';
+        body << listing.items[index].id;
+    }
+    body << R"HTML(';
+setInterval(async()=>{try{const r=await fetch(gitcubeStatusUrl);if(!r.ok)return;const d=await r.json();
 document.getElementById('active-count').textContent=d.active;document.getElementById('queued-count').textContent=d.queued;
 for(const repo of d.repositories){const e=document.querySelector('[data-repo-status="'+repo.id+'"]');if(e){e.textContent=repo.label+(repo.paused?' · paused':'');e.className='badge '+repo.css;}}
 }catch(e){}},2000);
@@ -563,9 +616,12 @@ HttpResponse Application::jobs_page(const HttpRequest& request) {
 HttpResponse Application::repository_page(std::int64_t id) {
     const auto repo = database_.get_repository(id);
     if (!repo) return HttpResponse::text("Repository not found", 404);
-    const auto branches = database_.list_refs(id, "branch");
-    const auto tags = database_.list_refs(id, "tag");
-    const auto releases = database_.list_releases(id);
+    const auto branches =
+        database_.list_refs(id, "branch", kMaxRenderedRefsPerType);
+    const auto tags = database_.list_refs(id, "tag", kMaxRenderedRefsPerType);
+    auto releases = database_.list_releases(id, kMaxRenderedReleases + 1);
+    const bool releases_truncated = releases.size() > kMaxRenderedReleases;
+    if (releases_truncated) releases.resize(kMaxRenderedReleases);
     const std::string ref = !repo->default_branch.empty() ? repo->default_branch : "HEAD";
     const std::string shown_status = display_status(*repo);
     std::string commits_error;
@@ -598,12 +654,19 @@ HttpResponse Application::repository_page(std::int64_t id) {
     body << "<tr><th>Export</th><td><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap\">"
          << "<form method=\"post\" action=\"/repo/" << id
          << "/archive\" style=\"display:flex;gap:10px;align-items:center\"><input type=\"hidden\" name=\"csrf\" value=\""
-         << html_escape(csrf_token_) << "\"><select name=\"ref\" style=\"width:auto\">";
+         << html_escape(csrf_token_) << "\"><select name=\"ref\" style=\"width:auto\">"
+         << "<option value=\"" << html_escape(ref) << "\" selected>"
+         << html_escape(ref) << "</option>";
     for (const auto& branch : branches) {
-        body << "<option value=\"" << html_escape(branch.name) << "\"" << (branch.name == ref ? " selected" : "") << ">"
+        if (branch.name == ref) continue;
+        body << "<option value=\"" << html_escape(branch.name) << "\">"
              << html_escape(branch.name) << "</option>";
     }
-    for (const auto& tag : tags) body << "<option value=\"" << html_escape(tag.name) << "\">" << html_escape(tag.name) << "</option>";
+    for (const auto& tag : tags) {
+        if (tag.name == ref) continue;
+        body << "<option value=\"" << html_escape(tag.name) << "\">"
+             << html_escape(tag.name) << "</option>";
+    }
     body << "</select><button type=\"submit\" class=\"secondary\">Download files (.zip)</button></form>"
          << action_form("/repo/" + std::to_string(id) + "/archive-git",
                         "Download whole repository (.git, .zip)", "secondary")
@@ -634,11 +697,22 @@ HttpResponse Application::repository_page(std::int64_t id) {
     }
     body << "</tbody></table></section>";
 
-    body << "<div class=\"grid\"><section><h2>Branches (" << branches.size() << ")</h2><ul>";
+    body << "<div class=\"grid\"><section><h2>Branches (" << repo->branch_count
+         << ")</h2><ul>";
     for (const auto& branch : branches) body << "<li><a href=\"/repo/" << id << "/tree?ref=" << url_encode(branch.name) << "\">" << html_escape(branch.name) << "</a></li>";
-    body << "</ul></section><section><h2>Tags (" << tags.size() << ")</h2><ul>";
+    body << "</ul>";
+    if (repo->branch_count > static_cast<std::int64_t>(branches.size())) {
+        body << "<p class=\"muted\">Showing the first " << branches.size()
+             << " branches.</p>";
+    }
+    body << "</section><section><h2>Tags (" << repo->tag_count << ")</h2><ul>";
     for (const auto& tag : tags) body << "<li><a href=\"/repo/" << id << "/tree?ref=" << url_encode(tag.name) << "\">" << html_escape(tag.name) << "</a> <span class=\"muted\">" << html_escape(short_oid(tag.target_oid)) << "</span></li>";
-    body << "</ul></section></div>";
+    body << "</ul>";
+    if (repo->tag_count > static_cast<std::int64_t>(tags.size())) {
+        body << "<p class=\"muted\">Showing the first " << tags.size()
+             << " tags.</p>";
+    }
+    body << "</section></div>";
 
     body << "<section><h2>Recent commits</h2>";
     if (!commits_error.empty()) body << "<p class=\"error\">" << html_escape(commits_error) << "</p>";
@@ -654,7 +728,12 @@ HttpResponse Application::repository_page(std::int64_t id) {
     body << "</section>";
 
     if (!releases.empty()) {
-        body << "<section><h2>GitHub releases</h2><table><thead><tr><th>Release</th><th>Tag</th><th>Published</th></tr></thead><tbody>";
+        body << "<section><h2>Latest GitHub releases</h2>";
+        if (releases_truncated) {
+            body << "<p class=\"muted\">Showing the latest "
+                 << kMaxRenderedReleases << " releases.</p>";
+        }
+        body << "<table><thead><tr><th>Release</th><th>Tag</th><th>Published</th></tr></thead><tbody>";
         for (const auto& release : releases) {
             body << "<tr><td><a rel=\"noreferrer\" href=\"" << html_escape(safe_href(release.html_url)) << "\">"
                  << html_escape(release.name.empty() ? release.tag_name : release.name) << "</a>"
@@ -836,12 +915,19 @@ HttpResponse Application::archive_git_download(std::int64_t id, const HttpReques
     return response;
 }
 
-HttpResponse Application::api_status() {
-    const auto repos = database_.list_repositories();
+HttpResponse Application::api_status(const HttpRequest& request) {
+    const auto repository_ids =
+        parse_status_repository_ids(query_value(request, "ids"));
+    if (!repository_ids) {
+        return HttpResponse::json(
+            "{\"error\":\"Invalid repository ID list\"}", 400);
+    }
+    const auto status = database_.dashboard_status(*repository_ids);
     std::ostringstream json;
-    json << "{\"active\":" << database_.active_job_count() << ",\"queued\":" << database_.queued_job_count() << ",\"repositories\":[";
+    json << "{\"active\":" << status.active_jobs << ",\"queued\":"
+         << status.queued_jobs << ",\"repositories\":[";
     bool first = true;
-    for (const auto& repo : repos) {
+    for (const auto& repo : status.repositories) {
         if (!first) json << ',';
         first = false;
         const std::string shown_status = display_status(repo);

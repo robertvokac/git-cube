@@ -118,6 +118,20 @@ struct JobPage {
     std::size_t total = 0;
 };
 
+struct RepositoryLiveStatus {
+    std::int64_t id = 0;
+    std::string status;
+    std::string operation;
+    std::string health_status;
+    bool paused = false;
+};
+
+struct DashboardStatus {
+    std::int64_t active_jobs = 0;
+    std::int64_t queued_jobs = 0;
+    std::vector<RepositoryLiveStatus> repositories;
+};
+
 class Database {
 public:
     explicit Database(std::filesystem::path path);
@@ -176,10 +190,14 @@ public:
     JobPage recent_jobs_page(const std::string& status_filter, std::size_t page, std::size_t per_page) const;
     std::int64_t active_job_count() const;
     std::int64_t queued_job_count() const;
+    DashboardStatus dashboard_status(
+        const std::vector<std::int64_t>& repository_ids) const;
 
-    std::vector<RefRecord> list_refs(std::int64_t repo_id, const std::string& type = {}) const;
+    std::vector<RefRecord> list_refs(std::int64_t repo_id, const std::string& type,
+                                     std::size_t limit) const;
     void replace_releases(std::int64_t repo_id, const std::vector<ReleaseRecord>& releases);
-    std::vector<ReleaseRecord> list_releases(std::int64_t repo_id) const;
+    std::vector<ReleaseRecord> list_releases(std::int64_t repo_id,
+                                             std::size_t limit) const;
 
     const std::filesystem::path& path() const { return path_; }
 

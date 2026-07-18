@@ -56,6 +56,11 @@ lossy filename-sanitization collisions while preserving every legacy storage pat
 pool instead of reopening SQLite and reapplying WAL configuration for every operation.
 The pool retains at most 32 idle handles and has a concurrent read/write regression test.
 
+**Bounded live UI queries** — two-second dashboard polling requests only the repository
+IDs visible on the current page (maximum 100) and gets job counters plus lightweight
+states in one pooled DB operation. Repository detail responses cap rendered refs and
+releases while retaining their complete database records.
+
 **Continuous integration** — GitHub Actions blocks on GCC Debug/Release, Clang Debug,
 warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake exposes
 dedicated warnings/sanitizer/coverage options, all CI builds are capped at two parallel

@@ -1,3 +1,4 @@
+#include "application.hpp"
 #include "data_directory_lock.hpp"
 #include "database.hpp"
 #include "git_service.hpp"
@@ -23,6 +24,16 @@
 #include <vector>
 
 namespace gitcube {
+struct ApplicationTestAccess {
+    static Database& database(Application& application) {
+        return application.database_;
+    }
+    static HttpResponse handle(Application& application,
+                               const HttpRequest& request) {
+        return application.handle_request(request);
+    }
+};
+
 struct HttpServerTestAccess {
     static void handle_client(const HttpServer& server, int client_fd) {
         server.handle_client(client_fd);
@@ -523,6 +534,14 @@ ALTER TABLE repositories DROP COLUMN canonical_url;
         repository_state = db.get_repository(added.id);
         require(repository_state && repository_state->operation == "cloning",
                 "Claimed repository operation was not stored");
+        const auto live_status =
+            db.dashboard_status({added.id, added.id, 999999});
+        require(live_status.active_jobs == 1 &&
+                    live_status.queued_jobs == 0 &&
+                    live_status.repositories.size() == 1 &&
+                    live_status.repositories.front().id == added.id &&
+                    live_status.repositories.front().operation == "cloning",
+                "Dashboard status must aggregate jobs and return only requested repositories");
         db.finish_job(job->id, true, "ok", "");
         repository_state = db.get_repository(added.id);
         require(repository_state && repository_state->operation.empty(),
@@ -573,6 +592,90 @@ ALTER TABLE repositories DROP COLUMN canonical_url;
         for (auto& thread : database_threads) thread.join();
         require(!concurrent_database_failure.load(),
                 "Pooled SQLite connections failed under concurrent reads and writes");
+
+        std::vector<gitcube::RefRecord> many_refs;
+        for (int index = 0; index < 20; ++index) {
+            many_refs.push_back(
+                {"branch", "branch-" + std::to_string(index), "branch-oid"});
+            many_refs.push_back(
+                {"tag", "tag-" + std::to_string(index), "tag-oid"});
+        }
+        db.sync_repository_refs_and_stats(added.id, many_refs, "branch-0",
+                                          "branch-oid", 20, 20, 40, false);
+        require(db.list_refs(added.id, "branch", 7).size() == 7 &&
+                    db.list_refs(added.id, "tag", 9).size() == 9,
+                "Repository ref queries must honor their response limit");
+
+        std::vector<gitcube::ReleaseRecord> many_releases;
+        for (int index = 0; index < 20; ++index) {
+            many_releases.push_back(
+                {index + 1, "v" + std::to_string(index),
+                 "Release " + std::to_string(index),
+                 "https://github.com/openeggbert/cna/releases/tag/v" +
+                     std::to_string(index),
+                 "2026-01-" + std::to_string(index + 10), false, false});
+        }
+        db.replace_releases(added.id, many_releases);
+        require(db.list_releases(added.id, 6).size() == 6,
+                "Repository release queries must honor their response limit");
+        bool excessive_status_ids_rejected = false;
+        try {
+            db.dashboard_status(std::vector<std::int64_t>(101, added.id));
+        } catch (const std::invalid_argument&) {
+            excessive_status_ids_rejected = true;
+        }
+        require(excessive_status_ids_rejected,
+                "Dashboard status must reject an excessive repository ID list");
+
+        std::atomic<bool> application_shutdown{false};
+        gitcube::Config application_config;
+        application_config.data_dir = temp / "status-application";
+        gitcube::Application status_application(
+            std::move(application_config), application_shutdown);
+        auto& status_database =
+            gitcube::ApplicationTestAccess::database(status_application);
+        status_database.initialize();
+        const auto first_status_repo = status_database.add_repository(*encoded_name);
+        const auto second_status_repo =
+            status_database.add_repository(*underscore_name);
+        require(first_status_repo.created && second_status_repo.created,
+                "Status API fixture repositories were not created");
+
+        gitcube::HttpRequest dashboard_request;
+        dashboard_request.method = "GET";
+        dashboard_request.path = "/";
+        const auto dashboard_response =
+            gitcube::ApplicationTestAccess::handle(status_application,
+                                                   dashboard_request);
+        const std::string expected_status_url =
+            "/api/status?ids=" + std::to_string(first_status_repo.id) + "," +
+            std::to_string(second_status_repo.id);
+        require(dashboard_response.status == 200 &&
+                    dashboard_response.body.find(expected_status_url) !=
+                        std::string::npos,
+                "Dashboard polling must request only repositories on the current page");
+
+        gitcube::HttpRequest status_request;
+        status_request.method = "GET";
+        status_request.path = "/api/status";
+        status_request.query_string =
+            "ids=" + std::to_string(second_status_repo.id);
+        const auto status_response =
+            gitcube::ApplicationTestAccess::handle(status_application,
+                                                   status_request);
+        require(status_response.status == 200 &&
+                    status_response.body.find(
+                        "\"id\":" + std::to_string(second_status_repo.id)) !=
+                        std::string::npos &&
+                    status_response.body.find(
+                        "\"id\":" + std::to_string(first_status_repo.id)) ==
+                        std::string::npos,
+                "Status API returned a repository that was not requested");
+        status_request.query_string = "ids=1,";
+        require(gitcube::ApplicationTestAccess::handle(status_application,
+                                                       status_request)
+                        .status == 400,
+                "Status API must reject a malformed repository ID list");
 
         db.update_repository_health(added.id, "healthy", "");
         repository_state = db.get_repository(added.id);

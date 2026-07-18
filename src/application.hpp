@@ -16,6 +16,8 @@
 
 namespace gitcube {
 
+struct ApplicationTestAccess;
+
 struct Config {
     std::filesystem::path data_dir;
     std::string bind_address = "127.0.0.1";
@@ -31,6 +33,8 @@ public:
     int run();
 
 private:
+    friend struct ApplicationTestAccess;
+
     Config config_;
     std::atomic<bool>& shutdown_requested_;
     Database database_;
@@ -60,7 +64,7 @@ private:
     HttpResponse commit_page(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_ref_download(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_git_download(std::int64_t id, const HttpRequest& request);
-    HttpResponse api_status();
+    HttpResponse api_status(const HttpRequest& request);
     HttpResponse check_repo_api(const HttpRequest& request);
 
     HttpResponse import_repositories(const HttpRequest& request);

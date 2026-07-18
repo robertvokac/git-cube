@@ -1047,14 +1047,64 @@ std::int64_t Database::queued_job_count() const {
     return stmt.step_row() ? stmt.integer(0) : 0;
 }
 
-std::vector<RefRecord> Database::list_refs(std::int64_t repo_id, const std::string& type) const {
+DashboardStatus Database::dashboard_status(
+    const std::vector<std::int64_t>& repository_ids) const {
+    constexpr std::size_t kMaxRepositoryIds = 100;
+    if (repository_ids.size() > kMaxRepositoryIds) {
+        throw std::invalid_argument("Dashboard status accepts at most 100 repository IDs");
+    }
+
+    ConnectionLease db(pool_, path_);
+    DashboardStatus result;
+    Statement counts(db.get(), R"SQL(
+SELECT
+ COALESCE(sum(CASE WHEN status='running' THEN 1 ELSE 0 END), 0),
+ COALESCE(sum(CASE WHEN status='queued' THEN 1 ELSE 0 END), 0)
+FROM jobs
+WHERE status IN ('running','queued')
+)SQL");
+    if (counts.step_row()) {
+        result.active_jobs = counts.integer(0);
+        result.queued_jobs = counts.integer(1);
+    }
+    if (repository_ids.empty()) return result;
+
+    std::string sql =
+        "SELECT id,status,operation,health_status,paused FROM repositories WHERE id IN (";
+    for (std::size_t index = 0; index < repository_ids.size(); ++index) {
+        if (index != 0) sql += ',';
+        sql += '?';
+    }
+    sql += ") ORDER BY id";
+    Statement repositories(db.get(), sql);
+    for (std::size_t index = 0; index < repository_ids.size(); ++index) {
+        repositories.bind(static_cast<int>(index + 1), repository_ids[index]);
+    }
+    while (repositories.step_row()) {
+        result.repositories.push_back(
+            {repositories.integer(0), repositories.text(1), repositories.text(2),
+             repositories.text(3), repositories.int_value(4) != 0});
+    }
+    return result;
+}
+
+std::vector<RefRecord> Database::list_refs(std::int64_t repo_id,
+                                           const std::string& type,
+                                           std::size_t limit) const {
     ConnectionLease db(pool_, path_);
     const std::string sql = type.empty()
-        ? "SELECT type,name,target_oid FROM refs WHERE repo_id=? ORDER BY type,name COLLATE NOCASE"
-        : "SELECT type,name,target_oid FROM refs WHERE repo_id=? AND type=? ORDER BY name COLLATE NOCASE";
+        ? "SELECT type,name,target_oid FROM refs WHERE repo_id=? "
+          "ORDER BY type,name COLLATE NOCASE LIMIT ?"
+        : "SELECT type,name,target_oid FROM refs WHERE repo_id=? AND type=? "
+          "ORDER BY name COLLATE NOCASE LIMIT ?";
     Statement stmt(db.get(), sql);
     stmt.bind(1, repo_id);
-    if (!type.empty()) stmt.bind(2, type);
+    if (type.empty()) {
+        stmt.bind(2, static_cast<std::int64_t>(limit));
+    } else {
+        stmt.bind(2, type);
+        stmt.bind(3, static_cast<std::int64_t>(limit));
+    }
     std::vector<RefRecord> refs;
     while (stmt.step_row()) refs.push_back({stmt.text(0), stmt.text(1), stmt.text(2)});
     return refs;
@@ -1087,10 +1137,14 @@ void Database::replace_releases(std::int64_t repo_id, const std::vector<ReleaseR
     }
 }
 
-std::vector<ReleaseRecord> Database::list_releases(std::int64_t repo_id) const {
+std::vector<ReleaseRecord> Database::list_releases(std::int64_t repo_id,
+                                                   std::size_t limit) const {
     ConnectionLease db(pool_, path_);
-    Statement stmt(db.get(), "SELECT github_id,tag_name,name,html_url,published_at,prerelease,draft FROM releases WHERE repo_id=? ORDER BY published_at DESC");
+    Statement stmt(db.get(),
+        "SELECT github_id,tag_name,name,html_url,published_at,prerelease,draft "
+        "FROM releases WHERE repo_id=? ORDER BY published_at DESC LIMIT ?");
     stmt.bind(1, repo_id);
+    stmt.bind(2, static_cast<std::int64_t>(limit));
     std::vector<ReleaseRecord> releases;
     while (stmt.step_row()) {
         releases.push_back({stmt.integer(0), stmt.text(1), stmt.text(2), stmt.text(3), stmt.text(4), stmt.int_value(5) != 0, stmt.int_value(6) != 0});
