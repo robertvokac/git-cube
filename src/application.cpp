@@ -13,6 +13,11 @@
 namespace gitcube {
 namespace {
 
+// Zip archives are fully buffered in memory (this server has no chunked/streaming
+// response support) before being sent, so cap how large one can grow rather than let an
+// oversized repository exhaust memory.
+constexpr std::size_t kMaxArchiveBytes = 500ULL * 1024 * 1024;
+
 std::string random_token() {
     std::random_device device;
     std::mt19937_64 generator(device());
@@ -81,6 +86,25 @@ std::string mime_for_path(const std::string& path, bool binary) {
 std::string clip(std::string_view value, std::size_t size) {
     if (value.size() <= size) return std::string(value);
     return std::string(value.substr(0, size)) + "…";
+}
+
+const char* importance_label(int importance) {
+    switch (importance) {
+        case 1: return "Low";
+        case 2: return "Medium";
+        case 3: return "High";
+        default: return "Undefined";
+    }
+}
+
+std::string importance_stars_html(int importance) {
+    if (importance <= 0) return "";
+    const char* css = importance == 1 ? "stars-1" : importance == 2 ? "stars-2" : "stars-3";
+    std::ostringstream out;
+    out << "<span class=\"stars " << css << "\" title=\"" << importance_label(importance) << "\">";
+    for (int i = 0; i < importance && i < 3; ++i) out << "\xE2\x98\x85"; // "★"
+    out << "</span>";
+    return out.str();
 }
 
 } // namespace
@@ -184,7 +208,7 @@ void Application::worker_loop(int worker_number) {
 HttpResponse Application::handle_request(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/") return dashboard(request);
     if (request.method == "GET" && request.path == "/add") return add_repositories_page();
-    if (request.method == "GET" && request.path == "/jobs") return jobs_page();
+    if (request.method == "GET" && request.path == "/jobs") return jobs_page(request);
     if (request.method == "GET" && request.path == "/api/status") return api_status();
     if (request.method == "GET" && request.path == "/favicon.svg") {
         return {200, "image/svg+xml", std::string(kFaviconSvg), {{"Cache-Control", "public, max-age=604800"}}};
@@ -209,13 +233,13 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "GET" ? repository_page(*id) : HttpResponse::text("Method not allowed", 405);
     }
-    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone)$)"))) {
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "POST" ? repository_action(*id, match[2].str(), request)
                                         : HttpResponse::text("Method not allowed", 405);
     }
-    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(tree|blob|raw|commits|commit)$)"))) {
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(tree|blob|raw|commits|commit|archive|archive-git)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         if (request.method != "GET") return HttpResponse::text("Method not allowed", 405);
@@ -224,7 +248,9 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         if (view == "blob") return blob_page(*id, request);
         if (view == "raw") return raw_blob(*id, request);
         if (view == "commits") return commits_page(*id, request);
-        return commit_page(*id, request);
+        if (view == "commit") return commit_page(*id, request);
+        if (view == "archive") return archive_ref_download(*id, request);
+        return archive_git_download(*id);
     }
     return HttpResponse{404, "text/html; charset=utf-8", page("Not found", "<section><h1>Not found</h1><p>The requested page does not exist.</p></section>"), {}};
 }
@@ -238,7 +264,7 @@ std::string Application::page(std::string_view title, std::string_view body) con
 <link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
-:root{color-scheme:light;--bg:#f3ead9;--panel:#faf5ea;--panel2:#e8dab5;--input:#fffdf6;--chip:#efe4c8;--text:#3b2f22;--muted:#8a7358;--line:#ddc9a3;--link:#8a5a2b;--ok:#4f7d4a;--bad:#a83f34;--busy:#b4791f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,sans-serif}header{background:var(--panel2);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;gap:24px;align-items:center}header strong{font-size:21px}header a{color:var(--text);text-decoration:none}.wrap{max-width:1440px;margin:auto;padding:24px}a{color:var(--link)}section,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:0 0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:18px}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.stat b{display:block;font-size:27px}.muted{color:var(--muted)}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px 8px;vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase}textarea,input,select{width:100%;background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:10px}button,.button{display:inline-block;background:var(--link);color:white;border:0;border-radius:7px;padding:9px 13px;text-decoration:none;cursor:pointer;font-weight:600}.secondary{background:var(--chip);color:var(--text)}.danger{background:var(--bad);color:white}.actions{display:flex;flex-wrap:wrap;gap:8px}.actions form{display:inline}.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:14px}.filters label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;margin-bottom:4px}.filters .field{min-width:160px}.pagination{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:14px}.badge{display:inline-block;padding:3px 8px;border-radius:999px;background:var(--chip);font-size:12px}.badge.ok{color:var(--ok)}.badge.bad{color:var(--bad)}.badge.busy{color:var(--busy)}code{background:var(--chip);border:1px solid var(--line);border-radius:4px;padding:1px 4px}pre{overflow:auto;background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:14px;white-space:pre}pre code{border:0;padding:0}.markdown{max-width:1000px}.markdown img{max-width:100%;height:auto}.markdown blockquote{border-left:4px solid var(--line);margin-left:0;padding-left:16px;color:var(--muted)}.notice{border-color:#7fa66a;background:#eef3df}.error{border-color:#c96a56;background:#fbeadf}.repo-name{font-weight:700}.path{font-family:ui-monospace,monospace}.right{text-align:right}.nowrap{white-space:nowrap}details pre{max-height:500px}.tabs{display:flex;gap:14px;margin:12px 0}.tabs a{text-decoration:none}.description{max-width:700px}.repo-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.repo-header h1{margin-top:0}@media(max-width:800px){.wrap{padding:12px}.repo-header{display:block}table{display:block;overflow:auto}}
+:root{color-scheme:light;--bg:#f3ead9;--panel:#faf5ea;--panel2:#e8dab5;--input:#fffdf6;--chip:#efe4c8;--text:#3b2f22;--muted:#8a7358;--line:#ddc9a3;--link:#8a5a2b;--ok:#4f7d4a;--bad:#a83f34;--busy:#b4791f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,sans-serif}header{background:var(--panel2);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;gap:24px;align-items:center}header strong{font-size:21px}header a{color:var(--text);text-decoration:none}.wrap{max-width:1440px;margin:auto;padding:24px}a{color:var(--link)}section,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:0 0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:18px}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.stat b{display:block;font-size:27px}.muted{color:var(--muted)}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px 8px;vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase}textarea,input,select{width:100%;background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:10px}button,.button{display:inline-block;background:var(--link);color:white;border:0;border-radius:7px;padding:9px 13px;text-decoration:none;cursor:pointer;font-weight:600}.secondary{background:var(--chip);color:var(--text)}.danger{background:var(--bad);color:white}.actions{display:flex;flex-wrap:wrap;gap:8px}.actions form{display:inline}.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:14px}.filters label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;margin-bottom:4px}.filters .field{min-width:160px}.pagination{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:14px}.badge{display:inline-block;padding:3px 8px;border-radius:999px;background:var(--chip);font-size:12px}.badge.ok{color:var(--ok)}.badge.bad{color:var(--bad)}.badge.busy{color:var(--busy)}.stars{letter-spacing:1px}.stars-1{color:#3f7e96}.stars-2{color:var(--busy)}.stars-3{color:var(--bad)}code{background:var(--chip);border:1px solid var(--line);border-radius:4px;padding:1px 4px}pre{overflow:auto;background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:14px;white-space:pre}pre code{border:0;padding:0}.markdown{max-width:1000px}.markdown img{max-width:100%;height:auto}.markdown blockquote{border-left:4px solid var(--line);margin-left:0;padding-left:16px;color:var(--muted)}.notice{border-color:#7fa66a;background:#eef3df}.error{border-color:#c96a56;background:#fbeadf}.repo-name{font-weight:700}.path{font-family:ui-monospace,monospace}.right{text-align:right}.nowrap{white-space:nowrap}details pre{max-height:500px}.tabs{display:flex;gap:14px;margin:12px 0}.tabs a{text-decoration:none}.description{max-width:700px}.repo-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.repo-header h1{margin-top:0}@media(max-width:800px){.wrap{padding:12px}.repo-header{display:block}table{display:block;overflow:auto}}
 </style></head><body><header><a href="/"><strong>GitCube</strong></a><a href="/">Repositories</a><a href="/add">Add repository</a><a href="/jobs">Jobs</a><span class="muted">local public Git mirror</span></header><main class="wrap">)HTML"
         << body << R"HTML(</main></body></html>)HTML";
     return out.str();
@@ -268,6 +294,7 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     filter.status = query_value(request, "status");
     filter.account = query_value(request, "account");
     filter.tag = query_value(request, "tag");
+    filter.importance = query_value(request, "importance");
     std::size_t page_number = 1;
     try { page_number = std::max<std::size_t>(1, std::stoull(query_value(request, "page", "1"))); } catch (...) {}
     constexpr std::size_t per_page = 25;
@@ -300,8 +327,16 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
          << html_escape(filter.account) << "\" placeholder=\"GitHub account\"></div>"
          << "<div class=\"field\"><label for=\"f-tag\">Tag</label><input id=\"f-tag\" type=\"text\" name=\"tag\" value=\""
          << html_escape(filter.tag) << "\" placeholder=\"git tag\"></div>"
+         << "<div class=\"field\"><label for=\"f-importance\">Importance</label><select id=\"f-importance\" name=\"importance\">"
+         << "<option value=\"\">Any</option>";
+    for (int level = 0; level <= 3; ++level) {
+        const std::string value = std::to_string(level);
+        body << "<option value=\"" << value << "\"" << (filter.importance == value ? " selected" : "") << ">"
+             << importance_label(level) << "</option>";
+    }
+    body << "</select></div>"
          << "<div class=\"field\"><button type=\"submit\">Filter</button></div>";
-    if (!filter.search.empty() || !filter.status.empty() || !filter.account.empty() || !filter.tag.empty()) {
+    if (!filter.search.empty() || !filter.status.empty() || !filter.account.empty() || !filter.tag.empty() || !filter.importance.empty()) {
         body << "<div class=\"field\"><a class=\"button secondary\" href=\"/\">Clear</a></div>";
     }
     body << "</form>";
@@ -309,12 +344,13 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     if (listing.items.empty()) {
         body << "<p>No repositories match.</p>";
     } else {
-        body << "<table><thead><tr><th>Repository</th><th>Account</th><th>Status</th><th>Refs</th><th>Last success</th><th>Metadata</th></tr></thead><tbody>";
+        body << "<table><thead><tr><th>Repository</th><th>Account</th><th>Importance</th><th>Status</th><th>Refs</th><th>Last success</th><th>Metadata</th></tr></thead><tbody>";
         for (const auto& repo : listing.items) {
             body << "<tr><td><a class=\"repo-name\" href=\"/repo/" << repo.id << "\">" << html_escape(repo.owner + "/" + repo.name)
                  << "</a><br><span class=\"muted\">" << html_escape(repo.host) << "</span>";
             if (!repo.description.empty()) body << "<div class=\"description muted\">" << html_escape(clip(repo.description, 180)) << "</div>";
             body << "</td><td>" << (repo.github ? html_escape(repo.owner) : "") << "</td>";
+            body << "<td>" << importance_stars_html(repo.importance) << "</td>";
             body << "<td><span data-repo-status=\"" << repo.id << "\" class=\"badge " << status_css(repo.status) << "\">"
                  << html_escape(status_label(repo.status)) << (repo.paused ? " · paused" : "") << "</span>";
             if (!repo.last_error.empty()) body << "<br><span class=\"muted\">" << html_escape(clip(repo.last_error, 140)) << "</span>";
@@ -327,7 +363,8 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
         body << "</tbody></table>";
 
         const std::string base = "/?q=" + url_encode(filter.search) + "&status=" + url_encode(filter.status) +
-            "&account=" + url_encode(filter.account) + "&tag=" + url_encode(filter.tag) + "&page=";
+            "&account=" + url_encode(filter.account) + "&tag=" + url_encode(filter.tag) +
+            "&importance=" + url_encode(filter.importance) + "&page=";
         body << "<div class=\"pagination\">";
         if (page_number > 1) body << "<a class=\"button secondary\" href=\"" << base << (page_number - 1) << "\">← Previous</a>";
         else body << "<span></span>";
@@ -360,21 +397,54 @@ HttpResponse Application::add_repositories_page() {
     return {200, "text/html; charset=utf-8", page("Add repositories", body.str()), {}};
 }
 
-HttpResponse Application::jobs_page() {
-    const auto jobs = database_.recent_jobs(200);
+HttpResponse Application::jobs_page(const HttpRequest& request) {
+    const std::string status_filter = query_value(request, "status");
+    std::size_t page_number = 1;
+    try { page_number = std::max<std::size_t>(1, std::stoull(query_value(request, "page", "1"))); } catch (...) {}
+    constexpr std::size_t per_page = 50;
+    const auto listing = database_.recent_jobs_page(status_filter, page_number, per_page);
+    const std::size_t page_count = listing.total == 0 ? 1 : (listing.total + per_page - 1) / per_page;
+    page_number = std::min(page_number, page_count);
+
     std::ostringstream body;
     body << "<section><h1>Job history</h1><p class=\"muted\">Running jobs survive ordinary restarts: interrupted rows are returned to the queue on the next start.</p>";
-    for (const auto& job : jobs) {
-        body << "<div class=\"panel\"><div><b>#" << job.id << " · " << html_escape(job.type) << "</b> <span class=\"badge "
-             << (job.status == "success" ? "ok" : job.status == "failed" ? "bad" : "busy") << "\">" << html_escape(job.status) << "</span>";
-        if (job.repo_id) body << " · <a href=\"/repo/" << *job.repo_id << "\">repository #" << *job.repo_id << "</a>";
-        else if (!job.payload.empty()) body << " · GitHub account <code>" << html_escape(job.payload) << "</code>";
-        body << "</div><div class=\"muted\">Queued " << html_escape(job.queued_at) << " · Started " << html_escape(job.started_at)
-             << " · Finished " << html_escape(job.finished_at) << " · Attempt " << job.attempts << "</div><p>" << html_escape(job.message) << "</p>";
-        if (!job.error.empty()) body << "<p class=\"error\">" << html_escape(job.error) << "</p>";
-        if (!job.output.empty()) body << "<details><summary>Command output</summary><pre>" << html_escape(job.output) << "</pre></details>";
+
+    body << "<form method=\"get\" action=\"/jobs\" class=\"filters\">"
+         << "<div class=\"field\"><label for=\"f-status\">Status</label><select id=\"f-status\" name=\"status\">"
+         << "<option value=\"\">Any</option>";
+    for (const char* status : {"queued", "running", "success", "failed", "interrupted"}) {
+        body << "<option value=\"" << status << "\"" << (status_filter == status ? " selected" : "") << ">"
+             << status << "</option>";
+    }
+    body << "</select></div><div class=\"field\"><button type=\"submit\">Filter</button></div>";
+    if (!status_filter.empty()) body << "<div class=\"field\"><a class=\"button secondary\" href=\"/jobs\">Clear</a></div>";
+    body << "</form>";
+
+    if (listing.items.empty()) {
+        body << "<p>No jobs match.</p>";
+    } else {
+        for (const auto& job : listing.items) {
+            body << "<div class=\"panel\"><div><b>#" << job.id << " · " << html_escape(job.type) << "</b> <span class=\"badge "
+                 << (job.status == "success" ? "ok" : job.status == "failed" ? "bad" : "busy") << "\">" << html_escape(job.status) << "</span>";
+            if (job.repo_id) body << " · <a href=\"/repo/" << *job.repo_id << "\">repository #" << *job.repo_id << "</a>";
+            else if (!job.payload.empty()) body << " · GitHub account <code>" << html_escape(job.payload) << "</code>";
+            body << "</div><div class=\"muted\">Queued " << html_escape(job.queued_at) << " · Started " << html_escape(job.started_at)
+                 << " · Finished " << html_escape(job.finished_at) << " · Attempt " << job.attempts << "</div><p>" << html_escape(job.message) << "</p>";
+            if (!job.error.empty()) body << "<p class=\"error\">" << html_escape(job.error) << "</p>";
+            if (!job.output.empty()) body << "<details><summary>Command output</summary><pre>" << html_escape(job.output) << "</pre></details>";
+            body << "</div>";
+        }
+
+        const std::string base = "/jobs?status=" + url_encode(status_filter) + "&page=";
+        body << "<div class=\"pagination\">";
+        if (page_number > 1) body << "<a class=\"button secondary\" href=\"" << base << (page_number - 1) << "\">← Previous</a>";
+        else body << "<span></span>";
+        body << "<span class=\"muted\">Page " << page_number << " of " << page_count << " · " << listing.total << " jobs</span>";
+        if (page_number < page_count) body << "<a class=\"button secondary\" href=\"" << base << (page_number + 1) << "\">Next →</a>";
+        else body << "<span></span>";
         body << "</div>";
     }
+
     body << "</section>";
     return {200, "text/html; charset=utf-8", page("Jobs", body.str()), {}};
 }
@@ -404,7 +474,27 @@ HttpResponse Application::repository_page(std::int64_t id) {
     if (!repo->last_error.empty()) body << "<p class=\"error\">" << html_escape(repo->last_error) << "</p>";
     body << "<div class=\"tabs\"><a href=\"/repo/" << id << "/tree?ref=" << url_encode(ref) << "\">Files</a><a href=\"/repo/" << id
          << "/commits?ref=" << url_encode(ref) << "\">Commits</a></div>";
-    body << "<table><tbody><tr><th>Storage</th><td class=\"path\">" << html_escape(repo->storage_relpath) << "</td></tr><tr><th>Default branch</th><td>"
+    body << "<table><tbody><tr><th>Importance</th><td><form method=\"post\" action=\"/repo/" << id
+         << "/importance\" style=\"display:flex;gap:10px;align-items:center\"><input type=\"hidden\" name=\"csrf\" value=\""
+         << html_escape(csrf_token_) << "\"><select name=\"value\" style=\"width:auto\">";
+    for (int level = 0; level <= 3; ++level) {
+        body << "<option value=\"" << level << "\"" << (repo->importance == level ? " selected" : "") << ">"
+             << importance_label(level) << "</option>";
+    }
+    body << "</select><button type=\"submit\" class=\"secondary\">Set</button>" << importance_stars_html(repo->importance)
+         << "</form></td></tr>";
+    body << "<tr><th>Export</th><td><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap\">"
+         << "<form method=\"get\" action=\"/repo/" << id
+         << "/archive\" style=\"display:flex;gap:10px;align-items:center\"><select name=\"ref\" style=\"width:auto\">";
+    for (const auto& branch : branches) {
+        body << "<option value=\"" << html_escape(branch.name) << "\"" << (branch.name == ref ? " selected" : "") << ">"
+             << html_escape(branch.name) << "</option>";
+    }
+    for (const auto& tag : tags) body << "<option value=\"" << html_escape(tag.name) << "\">" << html_escape(tag.name) << "</option>";
+    body << "</select><button type=\"submit\" class=\"secondary\">Download files (.zip)</button></form>"
+         << "<a class=\"button secondary\" href=\"/repo/" << id << "/archive-git\">Download whole repository (.git, .zip)</a>"
+         << "</div></td></tr>";
+    body << "<tr><th>Storage</th><td class=\"path\">" << html_escape(repo->storage_relpath) << "</td></tr><tr><th>Default branch</th><td>"
          << html_escape(repo->default_branch.empty() ? "unknown" : repo->default_branch) << "</td></tr><tr><th>HEAD</th><td class=\"path\">"
          << html_escape(repo->head_oid) << "</td></tr><tr><th>Objects</th><td>" << repo->object_count << "</td></tr><tr><th>Last fetch</th><td>"
          << html_escape(repo->last_fetch_at.empty() ? "—" : repo->last_fetch_at) << "</td></tr><tr><th>Last health check</th><td>"
@@ -568,6 +658,39 @@ HttpResponse Application::commit_page(std::int64_t id, const HttpRequest& reques
     return {200, "text/html; charset=utf-8", page("Commit", body.str()), {}};
 }
 
+HttpResponse Application::archive_ref_download(std::int64_t id, const HttpRequest& request) {
+    const auto repo = database_.get_repository(id);
+    if (!repo) return HttpResponse::text("Repository not found", 404);
+    const std::string ref = query_value(request, "ref", repo->default_branch.empty() ? "HEAD" : repo->default_branch);
+    std::string error;
+    const auto archive = git_.archive_ref(*repo, ref, kMaxArchiveBytes, error);
+    if (!error.empty() || !archive.found) return HttpResponse::text(error.empty() ? "Could not build archive" : error, 404);
+    if (archive.too_large) return HttpResponse::text("Archive exceeds the size limit for this ref", 413);
+    HttpResponse response;
+    response.status = 200;
+    response.content_type = "application/zip";
+    response.body = archive.data;
+    const std::string filename = safe_header_filename(repo->owner + "-" + repo->name + "-" + ref) + ".zip";
+    response.headers["Content-Disposition"] = "attachment; filename=\"" + filename + "\"";
+    return response;
+}
+
+HttpResponse Application::archive_git_download(std::int64_t id) {
+    const auto repo = database_.get_repository(id);
+    if (!repo) return HttpResponse::text("Repository not found", 404);
+    std::string error;
+    const auto archive = git_.archive_bare_repository(*repo, kMaxArchiveBytes, error);
+    if (!error.empty() || !archive.found) return HttpResponse::text(error.empty() ? "Could not build archive" : error, 404);
+    if (archive.too_large) return HttpResponse::text("Repository exceeds the size limit for a bare-repository archive", 413);
+    HttpResponse response;
+    response.status = 200;
+    response.content_type = "application/zip";
+    response.body = archive.data;
+    const std::string filename = safe_header_filename(repo->owner + "-" + repo->name + ".git") + ".zip";
+    response.headers["Content-Disposition"] = "attachment; filename=\"" + filename + "\"";
+    return response;
+}
+
 HttpResponse Application::api_status() {
     const auto repos = database_.list_repositories();
     std::ostringstream json;
@@ -650,6 +773,16 @@ HttpResponse Application::repository_action(std::int64_t id, const std::string& 
         database_.set_repository_paused(id, false);
         notice = "Repository resumed";
         notify_workers();
+    } else if (action == "importance") {
+        const auto form = parse_urlencoded(request.body);
+        const auto it = form.find("value");
+        int importance = -1;
+        if (it != form.end()) { try { importance = std::stoi(it->second); } catch (...) {} }
+        if (importance < 0 || importance > 3) {
+            return HttpResponse::redirect("/repo/" + std::to_string(id) + "?error=" + url_encode("Invalid importance value"));
+        }
+        database_.set_repository_importance(id, importance);
+        notice = "Importance set to " + std::string(importance_label(importance));
     } else {
         const std::string type = action == "clone" ? "clone" : action;
         const bool queued = database_.enqueue_job(id, type, "Requested from repository page");

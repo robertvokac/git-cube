@@ -47,13 +47,15 @@ private:
     HttpResponse handle_request(const HttpRequest& request);
     HttpResponse dashboard(const HttpRequest& request);
     HttpResponse add_repositories_page();
-    HttpResponse jobs_page();
+    HttpResponse jobs_page(const HttpRequest& request);
     HttpResponse repository_page(std::int64_t id);
     HttpResponse tree_page(std::int64_t id, const HttpRequest& request);
     HttpResponse blob_page(std::int64_t id, const HttpRequest& request);
     HttpResponse raw_blob(std::int64_t id, const HttpRequest& request);
     HttpResponse commits_page(std::int64_t id, const HttpRequest& request);
     HttpResponse commit_page(std::int64_t id, const HttpRequest& request);
+    HttpResponse archive_ref_download(std::int64_t id, const HttpRequest& request);
+    HttpResponse archive_git_download(std::int64_t id);
     HttpResponse api_status();
 
     HttpResponse import_repositories(const HttpRequest& request);

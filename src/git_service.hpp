@@ -61,6 +61,13 @@ struct BlobResult {
     std::uintmax_t size = 0;
 };
 
+struct ArchiveResult {
+    bool found = false;
+    bool too_large = false;
+    std::string data;
+    std::uintmax_t size = 0;
+};
+
 class GitService {
 public:
     GitService(std::filesystem::path data_dir, Database& database,
@@ -78,6 +85,14 @@ public:
                          std::string& error) const;
     std::string show_commit(const Repository& repo, const std::string& oid,
                             std::size_t max_bytes, std::string& error) const;
+    // Zips the tree contents of `ref` (git archive) — just the files, as they'd appear
+    // in a checkout, no .git history.
+    ArchiveResult archive_ref(const Repository& repo, const std::string& ref,
+                              std::size_t max_bytes, std::string& error) const;
+    // Zips the bare mirror directory itself (refs, objects, packs — everything needed to
+    // re-clone it), with no working tree since one was never created.
+    ArchiveResult archive_bare_repository(const Repository& repo, std::size_t max_bytes,
+                                          std::string& error) const;
 
 private:
     std::filesystem::path data_dir_;

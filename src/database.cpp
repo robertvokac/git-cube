@@ -2,6 +2,7 @@
 
 #include <sqlite3.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <utility>
 
@@ -44,6 +45,7 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
 )SQL"},
     {3, "ALTER TABLE jobs ADD COLUMN scheduled_at TEXT NOT NULL DEFAULT '';"},
+    {4, "ALTER TABLE repositories ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;"},
 };
 
 
@@ -196,6 +198,7 @@ Repository read_repository(Statement& stmt) {
     r.branch_count = stmt.integer(c++);
     r.tag_count = stmt.integer(c++);
     r.object_count = stmt.integer(c++);
+    r.importance = stmt.int_value(c++);
     return r;
 }
 
@@ -204,7 +207,7 @@ const char* repository_columns = R"SQL(
  paused, is_github, default_branch, description, homepage, html_url, license,
  archived, is_fork, stars, forks, open_issues, github_repo_id, created_at,
  updated_at, pushed_at, metadata_fetched_at, last_fetch_at, last_success_at,
- last_health_at, last_error, head_oid, branch_count, tag_count, object_count
+ last_health_at, last_error, head_oid, branch_count, tag_count, object_count, importance
 )SQL";
 
 Job read_job(Statement& stmt) {
@@ -307,17 +310,15 @@ CREATE INDEX IF NOT EXISTS idx_repositories_host_owner_name ON repositories(host
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_id INTEGER REFERENCES repositories(id) ON DELETE CASCADE,
-    type TEXT NOT NULL CHECK(type IN ('clone','fetch','health','metadata','account')),
+    type TEXT NOT NULL CHECK(type IN ('clone','fetch','health','metadata')),
     status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','success','failed','interrupted')),
     queued_at TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT '',
     message TEXT NOT NULL DEFAULT '',
-    payload TEXT NOT NULL DEFAULT '',
     output TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
-    attempts INTEGER NOT NULL DEFAULT 0,
-    scheduled_at TEXT NOT NULL DEFAULT ''
+    attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status_id ON jobs(status, id);
 CREATE INDEX IF NOT EXISTS idx_jobs_repo ON jobs(repo_id, id DESC);
@@ -461,6 +462,7 @@ WHERE (?1 = '' OR owner LIKE '%'||?1||'%' ESCAPE '\' OR name LIKE '%'||?1||'%' E
         SELECT 1 FROM refs WHERE refs.repo_id = repositories.id AND refs.type = 'tag'
           AND refs.name LIKE '%'||?4||'%' ESCAPE '\'
       ))
+  AND (?5 = '' OR importance = CAST(?5 AS INTEGER))
 )SQL";
 
 void bind_repository_filter(Statement& stmt, const RepositoryFilter& filter) {
@@ -468,6 +470,7 @@ void bind_repository_filter(Statement& stmt, const RepositoryFilter& filter) {
     stmt.bind(2, filter.status);
     stmt.bind(3, filter.account);
     stmt.bind(4, filter.tag);
+    stmt.bind(5, filter.importance);
 }
 
 } // namespace
@@ -485,10 +488,10 @@ RepositoryPage Database::list_repositories_page(const RepositoryFilter& filter, 
 
     Statement stmt(db.get(), std::string("SELECT ") + repository_columns + " FROM repositories " +
         kRepositoryFilterWhere +
-        " ORDER BY host COLLATE NOCASE, owner COLLATE NOCASE, name COLLATE NOCASE LIMIT ?5 OFFSET ?6");
+        " ORDER BY host COLLATE NOCASE, owner COLLATE NOCASE, name COLLATE NOCASE LIMIT ?6 OFFSET ?7");
     bind_repository_filter(stmt, filter);
-    stmt.bind(5, static_cast<std::int64_t>(per_page));
-    stmt.bind(6, static_cast<std::int64_t>((page - 1) * per_page));
+    stmt.bind(6, static_cast<std::int64_t>(per_page));
+    stmt.bind(7, static_cast<std::int64_t>((page - 1) * per_page));
     while (stmt.step_row()) result.items.push_back(read_repository(stmt));
     return result;
 }
@@ -513,6 +516,16 @@ bool Database::set_repository_paused(std::int64_t id, bool paused) {
     Connection db(path_);
     Statement stmt(db.get(), "UPDATE repositories SET paused=?, modified_at=? WHERE id=?");
     stmt.bind(1, paused ? 1 : 0);
+    stmt.bind(2, now_utc());
+    stmt.bind(3, id);
+    stmt.step_done();
+    return sqlite3_changes(db.get()) > 0;
+}
+
+bool Database::set_repository_importance(std::int64_t id, int importance) {
+    Connection db(path_);
+    Statement stmt(db.get(), "UPDATE repositories SET importance=?, modified_at=? WHERE id=?");
+    stmt.bind(1, importance);
     stmt.bind(2, now_utc());
     stmt.bind(3, id);
     stmt.step_done();
@@ -743,16 +756,26 @@ void Database::update_job_message(std::int64_t job_id, const std::string& messag
     stmt.step_done();
 }
 
-std::vector<Job> Database::recent_jobs(std::size_t limit) const {
+JobPage Database::recent_jobs_page(const std::string& status_filter, std::size_t page, std::size_t per_page) const {
     Connection db(path_);
+    Statement count_stmt(db.get(), "SELECT count(*) FROM jobs WHERE ?1 = '' OR status = ?1");
+    count_stmt.bind(1, status_filter);
+    JobPage result;
+    result.total = count_stmt.step_row() ? static_cast<std::size_t>(count_stmt.integer(0)) : 0;
+
+    const std::size_t page_count = result.total == 0 ? 1 : (result.total + per_page - 1) / per_page;
+    page = std::max<std::size_t>(1, std::min(page, page_count));
+
     Statement stmt(db.get(), R"SQL(
 SELECT id,repo_id,type,status,queued_at,started_at,finished_at,message,payload,output,error,attempts
-FROM jobs ORDER BY id DESC LIMIT ?
+FROM jobs WHERE ?1 = '' OR status = ?1
+ORDER BY id DESC LIMIT ?2 OFFSET ?3
 )SQL");
-    stmt.bind(1, static_cast<std::int64_t>(limit));
-    std::vector<Job> jobs;
-    while (stmt.step_row()) jobs.push_back(read_job(stmt));
-    return jobs;
+    stmt.bind(1, status_filter);
+    stmt.bind(2, static_cast<std::int64_t>(per_page));
+    stmt.bind(3, static_cast<std::int64_t>((page - 1) * per_page));
+    while (stmt.step_row()) result.items.push_back(read_job(stmt));
+    return result;
 }
 
 std::int64_t Database::active_job_count() const {

@@ -546,4 +546,38 @@ std::string GitService::show_commit(const Repository& repo, const std::string& o
     return result.output;
 }
 
+ArchiveResult GitService::archive_ref(const Repository& repo, const std::string& ref,
+                                      std::size_t max_bytes, std::string& error) const {
+    ArchiveResult archive;
+    if (!repository_available(repo)) { error = "Repository is not available locally"; return archive; }
+    if (!valid_git_ref(ref)) { error = "Invalid ref"; return archive; }
+    auto result = ProcessRunner::run(git_args(repo, {"archive", "--format=zip", "-9", ref}), {}, nullptr,
+                                     std::chrono::minutes(10), std::chrono::seconds(1), max_bytes + 1);
+    if (result.exit_code != 0) { error = trim(result.output); return archive; }
+    if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
+    archive.found = true;
+    archive.size = result.output.size();
+    archive.data = std::move(result.output);
+    return archive;
+}
+
+ArchiveResult GitService::archive_bare_repository(const Repository& repo, std::size_t max_bytes,
+                                                  std::string& error) const {
+    ArchiveResult archive;
+    const auto path = repo_path(repo);
+    if (!std::filesystem::is_directory(path)) { error = "Repository is not available locally"; return archive; }
+    // Run from the parent directory and pass just the bare-repo's own directory name, so
+    // the zip's internal paths are relative ("reponame.git/objects/...") instead of
+    // leaking this host's absolute filesystem layout.
+    auto result = ProcessRunner::run({"zip", "-r", "-q", "-X", "-", path.filename().string()},
+                                     path.parent_path(), nullptr, std::chrono::minutes(10),
+                                     std::chrono::seconds(1), max_bytes + 1);
+    if (result.exit_code != 0) { error = trim(result.output); return archive; }
+    if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
+    archive.found = true;
+    archive.size = result.output.size();
+    archive.data = std::move(result.output);
+    return archive;
+}
+
 } // namespace gitcube

@@ -44,6 +44,8 @@ struct Repository {
     std::int64_t branch_count = 0;
     std::int64_t tag_count = 0;
     std::int64_t object_count = 0;
+    // 0 = undefined, 1 = low, 2 = medium, 3 = high.
+    int importance = 0;
 };
 
 struct Job {
@@ -91,14 +93,20 @@ struct ImportedRepository {
 };
 
 struct RepositoryFilter {
-    std::string search;   // matches owner, name, host or description (substring, case-insensitive)
-    std::string status;   // exact status match, empty = any
-    std::string account;  // GitHub owner (substring); only matches is_github=1 rows
-    std::string tag;      // matches a git tag name on the repository (substring)
+    std::string search;     // matches owner, name, host or description (substring, case-insensitive)
+    std::string status;     // exact status match, empty = any
+    std::string account;    // GitHub owner (substring); only matches is_github=1 rows
+    std::string tag;        // matches a git tag name on the repository (substring)
+    std::string importance; // "0".."3", exact match; empty = any
 };
 
 struct RepositoryPage {
     std::vector<Repository> items;
+    std::size_t total = 0;
+};
+
+struct JobPage {
+    std::vector<Job> items;
     std::size_t total = 0;
 };
 
@@ -120,6 +128,7 @@ public:
     std::optional<Repository> get_repository_by_url(const std::string& normalized_url) const;
 
     bool set_repository_paused(std::int64_t id, bool paused);
+    bool set_repository_importance(std::int64_t id, int importance);
     void update_repository_status(std::int64_t id, const std::string& status,
                                   const std::string& error = {});
     void sync_repository_refs_and_stats(std::int64_t id, const std::vector<RefRecord>& refs,
@@ -148,7 +157,8 @@ public:
     void requeue_job(std::int64_t job_id, const std::string& message = {}, int delay_seconds = 0);
     void delay_pending_github_jobs(int delay_seconds);
     void update_job_message(std::int64_t job_id, const std::string& message);
-    std::vector<Job> recent_jobs(std::size_t limit = 50) const;
+    // status filter: exact match against job status; empty = any.
+    JobPage recent_jobs_page(const std::string& status_filter, std::size_t page, std::size_t per_page) const;
     std::int64_t active_job_count() const;
     std::int64_t queued_job_count() const;
 
