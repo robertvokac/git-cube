@@ -208,11 +208,21 @@ int main() {
                 "Unlisted Host header must be rejected");
         require(!gitcube::valid_http_host("localhost:1234", 9999, allowed_hosts),
                 "Wrong Host port must be rejected");
-        require(gitcube::valid_http_origin("http://localhost:9999", 9999, allowed_hosts),
+        require(gitcube::valid_http_origin("http://localhost:9999",
+                                           "localhost:9999", 9999, allowed_hosts),
                 "Same-origin Origin header was rejected");
-        require(!gitcube::valid_http_origin("https://localhost:9999", 9999, allowed_hosts),
-                "HTTPS origin must not match an HTTP server");
-        require(!gitcube::valid_http_origin("http://evil.example:9999", 9999,
+        require(gitcube::valid_http_origin("https://localhost:9999",
+                                           "localhost:9999", 9999, allowed_hosts),
+                "HTTPS reverse-proxy origin was rejected");
+        const std::vector<std::string> proxy_hosts{"gitcube.example"};
+        require(gitcube::valid_http_origin("https://gitcube.example",
+                                           "gitcube.example", 9999, proxy_hosts),
+                "HTTPS origin without an external port was rejected");
+        require(!gitcube::valid_http_origin("https://gitcube.example",
+                                            "localhost:9999", 9999, proxy_hosts),
+                "Origin and Host mismatch must be rejected");
+        require(!gitcube::valid_http_origin("http://evil.example:9999",
+                                            "localhost:9999", 9999,
                                             allowed_hosts),
                 "Cross-origin Origin header must be rejected");
 
@@ -270,6 +280,29 @@ int main() {
                         std::string::npos &&
                     handled_requests == 1,
                 "Cross-origin POST must be rejected before dispatch");
+
+            int proxied_posts = 0;
+            gitcube::HttpServer https_proxy_server(
+                "127.0.0.1", 9999, {"gitcube.example"},
+                [&](const gitcube::HttpRequest& request) {
+                    ++proxied_posts;
+                    require(request.method == "POST" &&
+                                request.path == "/import",
+                            "HTTPS proxy request fields were parsed incorrectly");
+                    return gitcube::HttpResponse::text("https-proxy-ok");
+                },
+                http_shutdown);
+            const std::string https_proxy_response = exchange_http(
+                https_proxy_server,
+                "POST /import HTTP/1.1\r\nHost: gitcube.example\r\n"
+                "Origin: https://gitcube.example\r\n"
+                "Sec-Fetch-Site: same-origin\r\nContent-Length: 0\r\n\r\n");
+            require(
+                https_proxy_response.find("HTTP/1.1 200 OK") !=
+                        std::string::npos &&
+                    https_proxy_response.ends_with("https-proxy-ok") &&
+                    proxied_posts == 1,
+                "Same-origin POST through an HTTPS proxy was rejected");
 
             gitcube::HttpServer throwing_server(
                 "127.0.0.1", 9999, {},

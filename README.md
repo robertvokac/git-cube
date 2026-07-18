@@ -443,7 +443,9 @@ the optimization cannot turn a temporary traffic spike into an unbounded RAM cac
   unless `--allow-remote-unauthenticated` and at least one `--allowed-host` are both
   supplied; that explicit escape hatch still needs authentication and TLS in front of it.
 - HTTP/1.1 requests must use an allowed `Host`; cross-site browser POSTs and mismatched
-  `Origin` headers are rejected to limit DNS-rebinding and cross-origin attacks.
+  `Origin` headers are rejected to limit DNS-rebinding and cross-origin attacks. Both
+  HTTP and HTTPS origins are supported when their authority matches that validated
+  `Host`, so a TLS reverse proxy can preserve the browser's original origin.
 - Every POST requires a per-process CSRF token embedded in the page (checked in
   `Application::valid_csrf`).
 - `git`/`curl`/`zip` are invoked with `posix_spawnp` and an argument array — **never** through

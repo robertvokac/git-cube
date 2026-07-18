@@ -117,15 +117,42 @@ bool valid_http_host(const std::string& host_header, int server_port,
     return allowed_host_name(authority->host, allowed_hosts);
 }
 
-bool valid_http_origin(const std::string& origin, int server_port,
+bool valid_http_origin(const std::string& origin, const std::string& host_header,
+                       int server_port,
                        const std::vector<std::string>& allowed_hosts) {
-    constexpr std::string_view prefix = "http://";
     const std::string normalized = to_lower(trim(origin));
-    if (!normalized.starts_with(prefix)) return false;
-    const auto authority = parse_authority(
-        std::string_view(normalized).substr(prefix.size()), 80);
-    if (!authority || authority->port != server_port) return false;
-    return allowed_host_name(authority->host, allowed_hosts);
+    std::string_view authority_text;
+    int origin_default_port = 0;
+    if (normalized.starts_with("http://")) {
+        authority_text = std::string_view(normalized).substr(7);
+        origin_default_port = 80;
+    } else if (normalized.starts_with("https://")) {
+        authority_text = std::string_view(normalized).substr(8);
+        origin_default_port = 443;
+    } else {
+        return false;
+    }
+
+    const auto origin_authority =
+        parse_authority(authority_text, origin_default_port);
+    const auto request_authority = parse_authority(host_header, server_port);
+    if (!origin_authority || !request_authority ||
+        origin_authority->host != request_authority->host ||
+        !allowed_host_name(origin_authority->host, allowed_hosts)) {
+        return false;
+    }
+
+    if (origin_authority->explicit_port && request_authority->explicit_port) {
+        return origin_authority->port == request_authority->port;
+    }
+    if (!origin_authority->explicit_port && !request_authority->explicit_port) {
+        return true;
+    }
+    // An explicitly written default scheme port is equivalent to omitting it.
+    if (origin_authority->explicit_port) {
+        return origin_authority->port == origin_default_port;
+    }
+    return request_authority->port == origin_default_port;
 }
 
 HttpResponse HttpResponse::redirect(std::string location, int status) {
@@ -392,7 +419,7 @@ void HttpServer::handle_client(int client_fd) const {
                        to_lower(request.headers.at("sec-fetch-site")) == "cross-site") {
                 response = HttpResponse::text("Cross-site POST is not allowed", 403);
             } else if (request.method == "POST" && request.headers.contains("origin") &&
-                       !valid_http_origin(request.headers.at("origin"), port_,
+                       !valid_http_origin(request.headers.at("origin"), host->second, port_,
                                           allowed_hosts_)) {
                 response = HttpResponse::text("Invalid Origin header", 403);
             } else {

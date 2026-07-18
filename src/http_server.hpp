@@ -54,7 +54,8 @@ struct HttpResponse {
 bool is_loopback_ipv4(const std::string& address);
 bool valid_http_host(const std::string& host_header, int server_port,
                      const std::vector<std::string>& allowed_hosts);
-bool valid_http_origin(const std::string& origin, int server_port,
+bool valid_http_origin(const std::string& origin, const std::string& host_header,
+                       int server_port,
                        const std::vector<std::string>& allowed_hosts);
 
 class HttpServer {
