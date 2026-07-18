@@ -3,7 +3,7 @@
 This is a running log of what has shipped and how it was verified, kept for anyone
 tracking the project's progress or picking up development. It intentionally does not
 explain how to use a feature or what GitCube's user-facing limitations are — that's
-[`README.md`](../README.md). Current database schema version: **6** (see
+[`README.md`](../README.md). Current database schema version: **7** (see
 `kMigrations[]` in `src/database.cpp`).
 
 ## Shipped, by area
@@ -60,6 +60,11 @@ The pool retains at most 32 idle handles and has a concurrent read/write regress
 IDs visible on the current page (maximum 100) and gets job counters plus lightweight
 states in one pooled DB operation. Repository detail responses cap rendered refs and
 releases while retaining their complete database records.
+
+**Bounded job history** — schema v7 adds indexes for active-job dedup/claiming,
+terminal-history pruning and release ordering. GitCube retains the latest 5,000 finished
+jobs and full command output for the latest 200; active/queued work is never pruned.
+Message, payload, output and error fields are capped at write time.
 
 **Continuous integration** — GitHub Actions blocks on GCC Debug/Release, Clang Debug,
 warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake exposes

@@ -226,7 +226,8 @@ after a hard crash.
 `success`, `failed`, `interrupted`). Each entry shows its type, timestamps, attempt
 count, the message GitCube recorded, and — on failure — the captured command output.
 Account-import jobs (no single repository) show the GitHub account name instead of a
-repository link.
+repository link. Retention keeps the latest 5,000 finished jobs and full command output
+for the latest 200; queued/running jobs are never removed.
 
 **Fetch all** / **Check all** on the home page bulk-queue a fetch or health job for
 every eligible repository (skipping paused ones, and — for fetch — repositories that
@@ -372,6 +373,7 @@ const Migration kMigrations[] = {
     {4, "ALTER TABLE repositories ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;"},
     {5, R"SQL( ... )SQL"},   // separates availability, operation, health and metadata state
     {6, R"SQL( ... )SQL"},   // adds indexed canonical URL identity for legacy rows
+    {7, R"SQL( ... )SQL"},   // adds active-job, retention and release-order indexes
 };
 ```
 

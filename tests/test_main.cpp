@@ -411,14 +411,14 @@ SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
                         migrated_repo->health_error == "old fsck failure" &&
                         migrated_repo->metadata_status == "unknown" &&
                         canonical_lookup && canonical_lookup->id == migrated_repo->id,
-                    "Schema v4 repository state did not migrate cleanly to v6");
+                    "Schema v4 repository state did not migrate cleanly to v7");
         }
         {
             gitcube::Database identity_db(temp / "identity.sqlite3");
             identity_db.initialize();
             require(query_integer(
                         temp / "identity.sqlite3",
-                        "SELECT max(version) FROM schema_migrations") == 6,
+                        "SELECT max(version) FROM schema_migrations") == 7,
                     "Fresh database did not reach the expected schema version");
             const auto punctuation = identity_db.add_repository(*encoded_name);
             const auto underscore = identity_db.add_repository(*underscore_name);
@@ -451,7 +451,58 @@ ALTER TABLE repositories DROP COLUMN canonical_url;
                 std::string::npos;
         }
         require(broken_schema_rejected,
-                "Schema verification must reject a database falsely claiming v6");
+                "Schema verification must reject a database falsely claiming v7");
+
+        const auto retention_path = temp / "retention.sqlite3";
+        {
+            gitcube::Database retention_fixture(retention_path);
+            retention_fixture.initialize();
+        }
+        execute_sql(retention_path, R"SQL(
+WITH RECURSIVE counter(value) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT value + 1 FROM counter WHERE value < 5010
+)
+INSERT INTO jobs(type,status,queued_at,finished_at,output,error)
+SELECT 'account','success',datetime('now'),datetime('now'),
+       'output-' || value,'error-' || value
+FROM counter;
+)SQL");
+        {
+            gitcube::Database retained(retention_path);
+            retained.initialize();
+            require(retained.enqueue_job(
+                        std::nullopt, "account", std::string(20000, 'm'),
+                        std::string(5000, 'p')),
+                    "Retention limit fixture job did not enqueue");
+            const auto capped_job = retained.claim_next_job();
+            require(capped_job && capped_job->message.size() == 16 * 1024 &&
+                        capped_job->payload.size() == 4 * 1024,
+                    "Job message or payload limit was not enforced");
+            retained.finish_job(capped_job->id, true,
+                                std::string(1024 * 1024 + 1, 'o'),
+                                std::string(64 * 1024 + 1, 'e'));
+            const auto newest_finished =
+                retained.recent_jobs_page("success", 1, 1);
+            require(newest_finished.items.size() == 1 &&
+                        newest_finished.items.front().output.size() ==
+                            1024 * 1024 &&
+                        newest_finished.items.front().error.size() == 64 * 1024,
+                    "Job output or error limit was not enforced");
+        }
+        require(query_integer(retention_path, "SELECT count(*) FROM jobs") == 5000,
+                "Finished job history was not pruned to 5000 rows");
+        require(query_integer(
+                    retention_path,
+                    "SELECT count(*) FROM jobs WHERE output<>''") == 200,
+                "Old command outputs were not pruned to the latest 200 jobs");
+        require(query_integer(
+                    retention_path,
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND "
+                    "name IN ('idx_jobs_active_repo_type','idx_jobs_terminal_id',"
+                    "'idx_releases_repo_published')") == 3,
+                "Schema v7 query indexes are missing");
 
         const auto printed = gitcube::ProcessRunner::run({"/usr/bin/printf", "hello"});
         require(printed.exit_code == 0 && printed.output == "hello",

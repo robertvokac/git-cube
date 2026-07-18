@@ -82,8 +82,22 @@ UPDATE repositories SET
 ALTER TABLE repositories ADD COLUMN canonical_url TEXT NOT NULL DEFAULT '';
 CREATE INDEX idx_repositories_canonical_url ON repositories(canonical_url);
 )SQL"},
+    {7, R"SQL(
+CREATE INDEX IF NOT EXISTS idx_jobs_active_repo_type
+  ON jobs(repo_id,type,status) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS idx_jobs_terminal_id
+  ON jobs(id DESC) WHERE status IN ('success','failed','interrupted');
+CREATE INDEX IF NOT EXISTS idx_releases_repo_published
+  ON releases(repo_id,published_at DESC);
+)SQL"},
 };
 
+constexpr std::size_t kMaxJobMessageBytes = 16 * 1024;
+constexpr std::size_t kMaxJobPayloadBytes = 4 * 1024;
+constexpr std::size_t kMaxJobOutputBytes = 1024 * 1024;
+constexpr std::size_t kMaxJobErrorBytes = 64 * 1024;
+constexpr std::size_t kRetainedFinishedJobs = 5000;
+constexpr std::size_t kRetainedJobOutputs = 200;
 
 class Connection {
 public:
@@ -258,6 +272,29 @@ void backfill_canonical_repository_urls(Connection& db) {
     }
 }
 
+void prune_job_history(Connection& db) {
+    Statement trim_output(db.get(), R"SQL(
+UPDATE jobs SET output=''
+WHERE output<>'' AND id IN (
+  SELECT id FROM jobs
+  WHERE status IN ('success','failed','interrupted')
+  ORDER BY id DESC LIMIT -1 OFFSET ?1
+)
+)SQL");
+    trim_output.bind(1, static_cast<std::int64_t>(kRetainedJobOutputs));
+    trim_output.step_done();
+
+    Statement trim_rows(db.get(), R"SQL(
+DELETE FROM jobs WHERE id IN (
+  SELECT id FROM jobs
+  WHERE status IN ('success','failed','interrupted')
+  ORDER BY id DESC LIMIT -1 OFFSET ?1
+)
+)SQL");
+    trim_rows.bind(1, static_cast<std::int64_t>(kRetainedFinishedJobs));
+    trim_rows.step_done();
+}
+
 Repository read_repository(Statement& stmt) {
     Repository r;
     int c = 0;
@@ -331,25 +368,27 @@ Job read_job(Statement& stmt) {
 
 bool enqueue_job_locked(sqlite3* db, std::optional<std::int64_t> repo_id, const std::string& type,
                         const std::string& message, const std::string& payload) {
+    const std::string stored_message = message.substr(0, kMaxJobMessageBytes);
+    const std::string stored_payload = payload.substr(0, kMaxJobPayloadBytes);
     if (repo_id) {
         Statement check(db, "SELECT 1 FROM jobs WHERE repo_id=? AND type=? AND status IN ('queued','running') LIMIT 1");
         check.bind(1, *repo_id);
         check.bind(2, type);
         if (check.step_row()) return false;
-    } else if (!payload.empty()) {
+    } else if (!stored_payload.empty()) {
         // Account-import jobs have no repo_id; dedup them on (type, payload) instead so
         // importing the same GitHub account twice in a row doesn't queue it twice.
         Statement check(db, "SELECT 1 FROM jobs WHERE repo_id IS NULL AND type=? AND payload=? AND status IN ('queued','running') LIMIT 1");
         check.bind(1, type);
-        check.bind(2, payload);
+        check.bind(2, stored_payload);
         if (check.step_row()) return false;
     }
     Statement stmt(db, "INSERT INTO jobs(repo_id,type,status,queued_at,message,payload) VALUES(?,?,'queued',?,?,?)");
     if (repo_id) stmt.bind(1, *repo_id); else stmt.bind_null(1);
     stmt.bind(2, type);
     stmt.bind(3, now_utc());
-    stmt.bind(4, message);
-    stmt.bind(5, payload);
+    stmt.bind(4, stored_message);
+    stmt.bind(5, stored_payload);
     stmt.step_done();
     if (repo_id && type == "clone") {
         Statement status(db, "UPDATE repositories SET status='queued', modified_at=? WHERE id=?");
@@ -522,6 +561,7 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime(
     run_pending_migrations(db.connection());
     verify_schema(db.connection());
     backfill_canonical_repository_urls(db.connection());
+    prune_job_history(db.connection());
 }
 
 void Database::recover_interrupted_jobs() {
@@ -946,8 +986,8 @@ void Database::finish_job(std::int64_t job_id, bool success, const std::string& 
         Statement stmt(db.get(), "UPDATE jobs SET status=?,finished_at=?,output=?,error=? WHERE id=?");
         stmt.bind(1, success ? "success" : "failed");
         stmt.bind(2, now_utc());
-        stmt.bind(3, output.substr(0, 1024 * 1024));
-        stmt.bind(4, error.substr(0, 65536));
+        stmt.bind(3, output.substr(0, kMaxJobOutputBytes));
+        stmt.bind(4, error.substr(0, kMaxJobErrorBytes));
         stmt.bind(5, job_id);
         stmt.step_done();
         Statement clear(db.get(),
@@ -956,6 +996,7 @@ void Database::finish_job(std::int64_t job_id, bool success, const std::string& 
         clear.bind(1, now_utc());
         clear.bind(2, job_id);
         clear.step_done();
+        prune_job_history(db.connection());
         db.exec("COMMIT;");
     } catch (...) {
         db.exec("ROLLBACK;");
@@ -975,7 +1016,7 @@ void Database::requeue_job(std::int64_t job_id, const std::string& message, int 
             "UPDATE jobs SET status='queued', started_at='', message=?, "
             "scheduled_at = CASE WHEN ?2 > 0 THEN datetime('now', '+' || ?2 || ' seconds') ELSE '' END "
             "WHERE id=?3");
-        stmt.bind(1, message);
+        stmt.bind(1, message.substr(0, kMaxJobMessageBytes));
         stmt.bind(2, delay_seconds);
         stmt.bind(3, job_id);
         stmt.step_done();
@@ -1008,7 +1049,7 @@ void Database::delay_pending_github_jobs(int delay_seconds) {
 void Database::update_job_message(std::int64_t job_id, const std::string& message) {
     ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE jobs SET message=? WHERE id=?");
-    stmt.bind(1, message);
+    stmt.bind(1, message.substr(0, kMaxJobMessageBytes));
     stmt.bind(2, job_id);
     stmt.step_done();
 }
