@@ -1,5 +1,6 @@
 #include "data_directory_lock.hpp"
 #include "database.hpp"
+#include "http_server.hpp"
 #include "json.hpp"
 #include "process.hpp"
 #include "util.hpp"
@@ -36,6 +37,25 @@ int main() {
         require(!gitcube::valid_git_ref("--upload-pack=x"), "option-like ref should be invalid");
         require(gitcube::markdown_to_safe_html("# Title\n\n<script>x</script>").find("<script>") == std::string::npos,
                 "Markdown HTML must be escaped");
+        const std::vector<std::string> allowed_hosts{"127.0.0.1", "localhost"};
+        require(gitcube::is_loopback_ipv4("127.0.0.1"), "Loopback detection failed");
+        require(gitcube::is_loopback_ipv4("127.42.0.1"), "127/8 must be loopback");
+        require(!gitcube::is_loopback_ipv4("0.0.0.0"), "Wildcard bind is not loopback");
+        require(gitcube::valid_http_host("localhost:9999", 9999, allowed_hosts),
+                "Allowed Host header was rejected");
+        require(gitcube::valid_http_host("127.0.0.1:9999", 9999, allowed_hosts),
+                "Allowed IP Host header was rejected");
+        require(!gitcube::valid_http_host("evil.example:9999", 9999, allowed_hosts),
+                "Unlisted Host header must be rejected");
+        require(!gitcube::valid_http_host("localhost:1234", 9999, allowed_hosts),
+                "Wrong Host port must be rejected");
+        require(gitcube::valid_http_origin("http://localhost:9999", 9999, allowed_hosts),
+                "Same-origin Origin header was rejected");
+        require(!gitcube::valid_http_origin("https://localhost:9999", 9999, allowed_hosts),
+                "HTTPS origin must not match an HTTP server");
+        require(!gitcube::valid_http_origin("http://evil.example:9999", 9999,
+                                            allowed_hosts),
+                "Cross-origin Origin header must be rejected");
 
         std::string json_error;
         const auto json = gitcube::Json::parse(R"({"id":123,"name":"cna","ok":true,"items":[1,2]})", json_error);

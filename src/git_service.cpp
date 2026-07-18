@@ -140,7 +140,7 @@ bool GitService::repository_available(const Repository& repo) const {
     if (!std::filesystem::is_directory(path)) return false;
     const auto result = ProcessRunner::run(
         {"git", "-c", "credential.helper=", "-c", "core.askPass=", "--git-dir",
-         path.string(), "rev-parse", "--is-bare-repository"}, {}, nullptr,
+         path.string(), "rev-parse", "--is-bare-repository"}, {}, &shutdown_requested_,
         std::chrono::seconds(10));
     return result.exit_code == 0 && trim(result.output) == "true";
 }
@@ -237,7 +237,8 @@ JobExecutionResult GitService::fetch_repository(const Job& job, const Repository
 JobExecutionResult GitService::synchronize_repository_state(const Repository& repo, bool fetched,
                                                             std::string prefix_output) {
     const auto refs_result = ProcessRunner::run(
-        git_args(repo, {"for-each-ref", "--format=%(refname)%09%(objectname)"}), {}, nullptr,
+        git_args(repo, {"for-each-ref", "--format=%(refname)%09%(objectname)"}), {},
+        &shutdown_requested_,
         std::chrono::seconds(30));
     if (refs_result.exit_code != 0) {
         const std::string diagnostic = process_error(refs_result);
@@ -263,16 +264,19 @@ JobExecutionResult GitService::synchronize_repository_state(const Repository& re
             refs.push_back({"other", full.substr(5), oid});
         }
     }
-    auto default_result = ProcessRunner::run(git_args(repo, {"symbolic-ref", "--short", "HEAD"}), {}, nullptr,
+    auto default_result = ProcessRunner::run(git_args(repo, {"symbolic-ref", "--short", "HEAD"}), {},
+                                             &shutdown_requested_,
                                              std::chrono::seconds(10));
     std::string default_branch = default_result.exit_code == 0 ? trim(default_result.output) : repo.default_branch;
     if (default_branch.starts_with("refs/heads/")) default_branch = default_branch.substr(11);
 
-    auto head_result = ProcessRunner::run(git_args(repo, {"rev-parse", "HEAD"}), {}, nullptr,
+    auto head_result = ProcessRunner::run(git_args(repo, {"rev-parse", "HEAD"}), {},
+                                          &shutdown_requested_,
                                           std::chrono::seconds(10));
     const std::string head_oid = head_result.exit_code == 0 ? trim(head_result.output) : std::string{};
 
-    auto count_result = ProcessRunner::run(git_args(repo, {"count-objects", "-v"}), {}, nullptr,
+    auto count_result = ProcessRunner::run(git_args(repo, {"count-objects", "-v"}), {},
+                                           &shutdown_requested_,
                                            std::chrono::seconds(30));
     std::int64_t objects = 0;
     if (count_result.exit_code == 0) {
@@ -497,7 +501,8 @@ std::vector<TreeEntry> GitService::list_tree(const Repository& repo, const std::
 
     std::string treeish = ref;
     if (!path.empty()) treeish += ":" + path;
-    auto result = ProcessRunner::run(git_args(repo, {"ls-tree", "-z", "-l", treeish}), {}, nullptr,
+    auto result = ProcessRunner::run(git_args(repo, {"ls-tree", "-z", "-l", treeish}), {},
+                                     &shutdown_requested_,
                                      std::chrono::seconds(30), std::chrono::seconds(1), 16 * 1024 * 1024);
     if (result.exit_code != 0) { error = process_error(result); return {}; }
 
@@ -539,7 +544,8 @@ std::vector<CommitInfo> GitService::list_commits(const Repository& repo, const s
     limit = std::min<std::size_t>(limit, 500);
     auto result = ProcessRunner::run(
         git_args(repo, {"log", "-n", std::to_string(limit),
-                        "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e", ref}), {}, nullptr,
+                        "--format=%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e", ref}), {},
+        &shutdown_requested_,
         std::chrono::seconds(30), std::chrono::seconds(1), 16 * 1024 * 1024);
     if (result.exit_code != 0) { error = process_error(result); return {}; }
     std::vector<CommitInfo> commits;
@@ -562,12 +568,14 @@ BlobResult GitService::read_blob(const Repository& repo, const std::string& ref,
     if (!repository_available(repo)) { error = "Repository is not available locally"; return blob; }
     if (!valid_git_ref(ref) || !valid_repo_path(path) || path.empty()) { error = "Invalid ref or path"; return blob; }
     const std::string object = ref + ":" + path;
-    auto size_result = ProcessRunner::run(git_args(repo, {"cat-file", "-s", object}), {}, nullptr,
+    auto size_result = ProcessRunner::run(git_args(repo, {"cat-file", "-s", object}), {},
+                                          &shutdown_requested_,
                                           std::chrono::seconds(10));
     if (size_result.exit_code != 0) { error = process_error(size_result); return blob; }
     blob.size = parse_uint(trim(size_result.output));
     if (blob.size > max_bytes) { blob.found = true; blob.too_large = true; return blob; }
-    auto result = ProcessRunner::run(git_args(repo, {"show", object}), {}, nullptr,
+    auto result = ProcessRunner::run(git_args(repo, {"show", object}), {},
+                                     &shutdown_requested_,
                                      std::chrono::seconds(30), std::chrono::seconds(1), max_bytes + 1);
     if (result.exit_code != 0) { error = process_error(result); return blob; }
     blob.found = true;
@@ -581,7 +589,8 @@ std::string GitService::show_commit(const Repository& repo, const std::string& o
     if (!repository_available(repo)) { error = "Repository is not available locally"; return {}; }
     if (!valid_git_ref(oid)) { error = "Invalid commit object"; return {}; }
     auto result = ProcessRunner::run(
-        git_args(repo, {"show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", oid}), {}, nullptr,
+        git_args(repo, {"show", "--format=fuller", "--stat", "--patch", "--no-ext-diff", oid}), {},
+        &shutdown_requested_,
         std::chrono::seconds(60), std::chrono::seconds(1), max_bytes);
     if (result.exit_code != 0) { error = process_error(result); return {}; }
     return result.output;
@@ -592,7 +601,8 @@ ArchiveResult GitService::archive_ref(const Repository& repo, const std::string&
     ArchiveResult archive;
     if (!repository_available(repo)) { error = "Repository is not available locally"; return archive; }
     if (!valid_git_ref(ref)) { error = "Invalid ref"; return archive; }
-    auto result = ProcessRunner::run(git_args(repo, {"archive", "--format=zip", "-9", ref}), {}, nullptr,
+    auto result = ProcessRunner::run(git_args(repo, {"archive", "--format=zip", "-9", ref}), {},
+                                     &shutdown_requested_,
                                      std::chrono::minutes(10), std::chrono::seconds(1), max_bytes + 1);
     if (result.exit_code != 0) { error = process_error(result); return archive; }
     if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }
@@ -611,7 +621,8 @@ ArchiveResult GitService::archive_bare_repository(const Repository& repo, std::s
     // the zip's internal paths are relative ("reponame.git/objects/...") instead of
     // leaking this host's absolute filesystem layout.
     auto result = ProcessRunner::run({"zip", "-r", "-q", "-X", "-", path.filename().string()},
-                                     path.parent_path(), nullptr, std::chrono::minutes(10),
+                                     path.parent_path(), &shutdown_requested_,
+                                     std::chrono::minutes(10),
                                      std::chrono::seconds(1), max_bytes + 1);
     if (result.exit_code != 0) { error = process_error(result); return archive; }
     if (result.output.size() > max_bytes) { archive.too_large = true; return archive; }

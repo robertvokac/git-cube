@@ -25,6 +25,9 @@ void print_usage(const char* program) {
               << "  --port PORT       HTTP port (default: 9999)\n"
               << "  --workers COUNT   Concurrent Git workers (default: 2)\n"
               << "  --bind ADDRESS    IPv4 address (default: 127.0.0.1)\n"
+              << "  --allowed-host H  Additional accepted HTTP Host name (repeatable)\n"
+              << "  --allow-remote-unauthenticated\n"
+              << "                    Permit a non-loopback bind without authentication\n"
               << "  --help            Show this help\n"
               << "  --version         Show version\n";
 }
@@ -78,6 +81,10 @@ int main(int argc, char** argv) {
                 config.workers = parse_integer(next("--workers"), "worker count", 1, 64);
             } else if (arg == "--bind") {
                 config.bind_address = next("--bind");
+            } else if (arg == "--allowed-host") {
+                config.allowed_hosts.push_back(next("--allowed-host"));
+            } else if (arg == "--allow-remote-unauthenticated") {
+                config.allow_remote_unauthenticated = true;
             } else {
                 throw std::runtime_error("Unknown option: " + arg);
             }

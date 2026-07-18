@@ -20,6 +20,8 @@ struct Config {
     std::string bind_address = "127.0.0.1";
     int port = 9999;
     int workers = 2;
+    bool allow_remote_unauthenticated = false;
+    std::vector<std::string> allowed_hosts;
 };
 
 class Application {

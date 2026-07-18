@@ -244,6 +244,9 @@ gets the graceful shutdown either.
 --port PORT       HTTP port, default 9999
 --workers COUNT   Concurrent Git workers, default 2
 --bind ADDRESS    IPv4 bind address, default 127.0.0.1
+--allowed-host H  Additional accepted HTTP Host name, repeatable
+--allow-remote-unauthenticated
+                  Permit a non-loopback bind without authentication
 --help            Show usage
 --version         Show version
 ```
@@ -267,7 +270,7 @@ them depend on a web framework or ORM:
 | `application.hpp/.cpp` | HTTP route dispatch and every page/handler — the only place that renders HTML or reads `HttpRequest`. Owns the worker threads and the CSRF token. |
 | `git_service.hpp/.cpp` | Every `git`/`curl` invocation: clone, fetch, health check, GitHub metadata, GitHub account listing, tree/blob/commit/archive reads. Takes a `Job` or `Repository`, never an `HttpRequest`. |
 | `database.hpp/.cpp` | The only file that touches SQLite. Schema, migrations, and every query, wrapped around a tiny RAII `Connection`/`Statement` pair (not a public API — see below). |
-| `http_server.hpp/.cpp` | The HTTP/1.1 server itself: POSIX sockets, request parsing, thread-per-connection with a concurrency cap, response headers (CSP etc.). Knows nothing about GitCube's routes. |
+| `http_server.hpp/.cpp` | The HTTP/1.1 server itself: POSIX sockets, bounded client queue and fixed worker pool, request parsing, Host/Origin checks, response deadlines and security headers. Knows nothing about GitCube's routes. |
 | `process.hpp/.cpp` | `posix_spawnp`/`waitpid` wrapper used for every child process, with separate stdout/stderr capture, a timeout, and graceful-shutdown-aware process-group termination. |
 | `json.hpp/.cpp` | A small recursive-descent JSON parser (with a nesting-depth cap) used to read GitHub API responses. Not a general-purpose library. |
 | `util.hpp/.cpp` | URL/repository-URL parsing and validation, HTML/JSON/URL escaping, the Markdown renderer, ref/path validation. |
@@ -351,8 +354,11 @@ happens to run first.
 ### Security model
 
 - GitCube binds to `127.0.0.1` by default and has no authentication — treat it as a
-  single-user local tool, same trust boundary as a CLI. Don't bind it to a non-loopback
-  address without putting real authentication and TLS in front of it.
+  single-user local tool, same trust boundary as a CLI. A non-loopback bind is refused
+  unless `--allow-remote-unauthenticated` and at least one `--allowed-host` are both
+  supplied; that explicit escape hatch still needs authentication and TLS in front of it.
+- HTTP/1.1 requests must use an allowed `Host`; cross-site browser POSTs and mismatched
+  `Origin` headers are rejected to limit DNS-rebinding and cross-origin attacks.
 - Every POST requires a per-process CSRF token embedded in the page (checked in
   `Application::valid_csrf`).
 - `git`/`curl`/`zip` are invoked with `posix_spawnp` and an argument array — **never** through
@@ -369,9 +375,10 @@ happens to run first.
 - Raw blob responses map file extension to content type conservatively —
   `.html`/`.svg`/`.xml`/etc. are all served as `text/plain` — so a script embedded in a
   mirrored repository's file can't execute in GitCube's own origin when viewed raw.
-- The HTTP server caps concurrent connections (64) and enforces a per-request wall-clock
-  deadline on receiving headers/body (30s), to bound a slow-client (slowloris-style)
-  connection instead of holding a thread open indefinitely.
+- The HTTP server uses 16 joinable client workers with a 64-connection bound and
+  wall-clock deadlines for both receiving a request and sending a response. Shutdown
+  closes every queued/active socket and joins the pool before application state is
+  destroyed.
 - The JSON parser used for GitHub API responses caps nesting depth to guard against a
   stack-overflow from a malformed/hostile response.
 

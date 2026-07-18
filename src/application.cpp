@@ -117,6 +117,15 @@ Application::Application(Config config, std::atomic<bool>& shutdown_requested)
 
 int Application::run() {
     try {
+        if (!is_loopback_ipv4(config_.bind_address) &&
+            !config_.allow_remote_unauthenticated) {
+            throw std::runtime_error(
+                "Refusing non-loopback --bind without --allow-remote-unauthenticated");
+        }
+        if (!is_loopback_ipv4(config_.bind_address) && config_.allowed_hosts.empty()) {
+            throw std::runtime_error(
+                "A non-loopback bind also requires at least one --allowed-host");
+        }
         std::filesystem::create_directories(config_.data_dir);
         std::filesystem::permissions(config_.data_dir, std::filesystem::perms::owner_all,
                                      std::filesystem::perm_options::replace);
@@ -136,7 +145,8 @@ int Application::run() {
         cleanup_orphaned_temp_dirs();
         start_workers();
 
-        server_ = std::make_unique<HttpServer>(config_.bind_address, config_.port,
+        server_ = std::make_unique<HttpServer>(
+            config_.bind_address, config_.port, config_.allowed_hosts,
             [this](const HttpRequest& request) { return handle_request(request); }, shutdown_requested_);
         std::cout << "GitCube listening on http://" << config_.bind_address << ':' << config_.port << "\n";
         std::cout << "Data directory: " << std::filesystem::absolute(config_.data_dir) << "\n";
