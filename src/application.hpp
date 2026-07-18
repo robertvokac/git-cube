@@ -57,6 +57,7 @@ private:
     HttpResponse archive_ref_download(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_git_download(std::int64_t id);
     HttpResponse api_status();
+    HttpResponse check_repo_api(const HttpRequest& request);
 
     HttpResponse import_repositories(const HttpRequest& request);
     HttpResponse enqueue_bulk(const HttpRequest& request, const std::string& type);

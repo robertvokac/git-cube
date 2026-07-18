@@ -210,6 +210,7 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/add") return add_repositories_page();
     if (request.method == "GET" && request.path == "/jobs") return jobs_page(request);
     if (request.method == "GET" && request.path == "/api/status") return api_status();
+    if (request.method == "GET" && request.path == "/api/check-repo") return check_repo_api(request);
     if (request.method == "GET" && request.path == "/favicon.svg") {
         return {200, "image/svg+xml", std::string(kFaviconSvg), {{"Cache-Control", "public, max-age=604800"}}};
     }
@@ -386,6 +387,13 @@ for(const repo of d.repositories){const e=document.querySelector('[data-repo-sta
 
 HttpResponse Application::add_repositories_page() {
     std::ostringstream body;
+    body << "<section><h2>Check a repository</h2><p class=\"muted\">See whether GitCube already has a repository "
+            "before adding it, without leaving this page.</p>"
+         << "<form id=\"check-form\" style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap\">"
+            "<input id=\"check-url\" type=\"text\" placeholder=\"https://github.com/openeggbert/cna\" style=\"flex:1;min-width:260px\">"
+            "<button type=\"submit\" class=\"secondary\">Check</button></form>"
+            "<p id=\"check-result\" class=\"muted\"></p></section>";
+
     body << "<section><h1>Add repositories</h1>"
          << "<p class=\"muted\">One http:// or https:// URL per line. A repository URL (for example "
             "https://github.com/openeggbert/cna) is placed into the persistent clone queue. A bare GitHub "
@@ -394,6 +402,35 @@ HttpResponse Application::add_repositories_page() {
          << "<form method=\"post\" action=\"/import\"><input type=\"hidden\" name=\"csrf\" value=\"" << html_escape(csrf_token_)
          << "\"><textarea name=\"urls\" rows=\"10\" placeholder=\"https://github.com/openeggbert/cna\nhttps://github.com/openeggbert\"></textarea>"
          << "<p><button type=\"submit\">Add to clone queue</button></p></form></section>";
+
+    body << R"HTML(<script>
+document.getElementById('check-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const url = document.getElementById('check-url').value.trim();
+  const result = document.getElementById('check-result');
+  if (!url) { result.textContent = ''; return; }
+  result.textContent = 'Checking…';
+  result.className = 'muted';
+  try {
+    const response = await fetch('/api/check-repo?url=' + encodeURIComponent(url));
+    const data = await response.json();
+    if (!data.ok) {
+      result.textContent = 'Not a valid repository URL: ' + data.error;
+      result.className = 'error';
+    } else if (data.exists) {
+      result.innerHTML = 'Already in GitCube as <a href="/repo/' + data.id + '">' +
+        data.name.replace(/&/g, '&amp;').replace(/</g, '&lt;') + '</a> (' + data.status + ')';
+      result.className = '';
+    } else {
+      result.textContent = 'Not yet added.';
+      result.className = '';
+    }
+  } catch (e) {
+    result.textContent = 'Check failed; try again.';
+    result.className = 'error';
+  }
+});
+</script>)HTML";
     return {200, "text/html; charset=utf-8", page("Add repositories", body.str()), {}};
 }
 
@@ -704,6 +741,26 @@ HttpResponse Application::api_status() {
              << "\",\"paused\":" << (repo.paused ? "true" : "false") << "}";
     }
     json << "]}";
+    return HttpResponse::json(json.str());
+}
+
+HttpResponse Application::check_repo_api(const HttpRequest& request) {
+    const std::string url = query_value(request, "url");
+    std::ostringstream json;
+    std::string parse_error;
+    const auto parsed = parse_repository_url(url, parse_error);
+    if (!parsed) {
+        json << "{\"ok\":false,\"error\":\"" << json_escape(parse_error) << "\"}";
+        return HttpResponse::json(json.str());
+    }
+    const auto existing = database_.get_repository_by_url(parsed->normalized);
+    if (!existing) {
+        json << "{\"ok\":true,\"exists\":false,\"normalized\":\"" << json_escape(parsed->normalized) << "\"}";
+        return HttpResponse::json(json.str());
+    }
+    json << "{\"ok\":true,\"exists\":true,\"id\":" << existing->id << ",\"status\":\""
+         << json_escape(status_label(existing->status)) << "\",\"name\":\""
+         << json_escape(existing->owner + "/" + existing->name) << "\"}";
     return HttpResponse::json(json.str());
 }
 
