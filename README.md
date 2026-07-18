@@ -420,20 +420,26 @@ happens to run first.
 
 ```bash
 # Debug build + unit tests
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
-cmake --build build -j
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DGITCUBE_WARNINGS_AS_ERRORS=ON
+cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure
 
 # AddressSanitizer + UndefinedBehaviorSanitizer
-cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer" \
-  -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
-cmake --build build-asan -j
-./build-asan/gitcube_tests
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DGITCUBE_WARNINGS_AS_ERRORS=ON -DGITCUBE_ENABLE_SANITIZERS=ON
+cmake --build build-asan --parallel 2
+ctest --test-dir build-asan --output-on-failure
+
+# Coverage instrumentation (report with gcovr after ctest)
+cmake -S . -B build-coverage -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+  -DGITCUBE_WARNINGS_AS_ERRORS=ON -DGITCUBE_ENABLE_COVERAGE=ON
 ```
 
-The library target (`gitcube_core`) builds with `-Wall -Wextra -Wpedantic -Wconversion
--Wshadow`; keep new code warning-clean under those flags.
+Every project target builds with `-Wall -Wextra -Wpedantic -Wconversion -Wshadow`.
+GitHub Actions runs GCC Debug/Release, Clang Debug, cppcheck, ASan+UBSan, and a gcovr
+line-coverage gate on every push/PR. CI and the examples above intentionally use at
+most two parallel build/test tasks to keep peak RAM bounded.
 
 ## Current limitations
 

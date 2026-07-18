@@ -9,13 +9,24 @@
 #include <sqlite3.h>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <sys/socket.h>
 #include <unistd.h>
+
+namespace gitcube {
+struct HttpServerTestAccess {
+    static void handle_client(const HttpServer& server, int client_fd) {
+        server.handle_client(client_fd);
+    }
+};
+}
 
 namespace {
 void require(bool condition, const char* message) {
@@ -38,6 +49,72 @@ void execute_sql(const std::filesystem::path& path, const char* sql) {
     if (result != SQLITE_OK) {
         throw std::runtime_error("Cannot prepare migration fixture: " + message);
     }
+}
+
+std::int64_t query_integer(const std::filesystem::path& path, const char* sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        const std::string message = db ? sqlite3_errmsg(db) : "cannot allocate handle";
+        if (db) sqlite3_close(db);
+        throw std::runtime_error("Cannot inspect test database: " + message);
+    }
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(db, sql, -1, &statement, nullptr) != SQLITE_OK) {
+        const std::string message = sqlite3_errmsg(db);
+        sqlite3_close(db);
+        throw std::runtime_error("Cannot inspect test database: " + message);
+    }
+    const int result = sqlite3_step(statement);
+    if (result != SQLITE_ROW) {
+        const std::string message = sqlite3_errmsg(db);
+        sqlite3_finalize(statement);
+        sqlite3_close(db);
+        throw std::runtime_error("Cannot inspect test database: " + message);
+    }
+    const std::int64_t value = sqlite3_column_int64(statement, 0);
+    sqlite3_finalize(statement);
+    sqlite3_close(db);
+    return value;
+}
+
+std::string exchange_http(const gitcube::HttpServer& server,
+                          std::string_view request) {
+    int sockets[2]{-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
+        throw std::runtime_error("Cannot create HTTP test socket pair");
+    }
+    std::size_t sent = 0;
+    while (sent < request.size()) {
+        const ssize_t count =
+            send(sockets[0], request.data() + sent, request.size() - sent,
+                 MSG_NOSIGNAL);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            const std::string message =
+                "Cannot write HTTP test request: " + std::string(std::strerror(errno));
+            close(sockets[0]);
+            close(sockets[1]);
+            throw std::runtime_error(message);
+        }
+        sent += static_cast<std::size_t>(count);
+    }
+    shutdown(sockets[0], SHUT_WR);
+    gitcube::HttpServerTestAccess::handle_client(server, sockets[1]);
+    shutdown(sockets[1], SHUT_RDWR);
+    close(sockets[1]);
+
+    std::string response;
+    char buffer[4096];
+    while (true) {
+        const ssize_t count = recv(sockets[0], buffer, sizeof(buffer), 0);
+        if (count > 0) {
+            response.append(buffer, static_cast<std::size_t>(count));
+        } else {
+            break;
+        }
+    }
+    close(sockets[0]);
+    return response;
 }
 }
 
@@ -126,6 +203,79 @@ int main() {
                                             allowed_hosts),
                 "Cross-origin Origin header must be rejected");
 
+        std::atomic<bool> http_shutdown{false};
+        const bool run_socket_tests =
+            std::getenv("GITCUBE_SKIP_SOCKET_TESTS") == nullptr;
+        if (run_socket_tests) {
+            int handled_requests = 0;
+            gitcube::HttpServer http_server(
+                "127.0.0.1", 9999, {},
+                [&](const gitcube::HttpRequest& request) {
+                    ++handled_requests;
+                    require(request.method == "GET" &&
+                                request.path == "/hello" &&
+                                request.query_string == "x=1",
+                            "HTTP request fields were parsed incorrectly");
+                    return gitcube::HttpResponse::text("socketpair-ok");
+                },
+                http_shutdown);
+            const std::string valid_response = exchange_http(
+                http_server,
+                "GET /hello?x=1 HTTP/1.1\r\nHost: localhost:9999\r\n\r\n");
+            require(
+                valid_response.find("HTTP/1.1 200 OK") != std::string::npos &&
+                    valid_response.ends_with("socketpair-ok") &&
+                    valid_response.find("Content-Security-Policy:") !=
+                        std::string::npos &&
+                    handled_requests == 1,
+                "Valid HTTP request/response exchange failed");
+
+            const std::string duplicate_host = exchange_http(
+                http_server,
+                "GET /hello HTTP/1.1\r\nHost: localhost:9999\r\n"
+                "Host: localhost:9999\r\n\r\n");
+            require(
+                duplicate_host.find("HTTP/1.1 400 Bad Request") !=
+                        std::string::npos &&
+                    handled_requests == 1,
+                "Duplicate HTTP headers must be rejected before dispatch");
+            const std::string transfer_encoding = exchange_http(
+                http_server,
+                "POST /hello HTTP/1.1\r\nHost: localhost:9999\r\n"
+                "Transfer-Encoding: chunked\r\n\r\n");
+            require(
+                transfer_encoding.find("HTTP/1.1 501 Not Implemented") !=
+                        std::string::npos &&
+                    handled_requests == 1,
+                "Unsupported Transfer-Encoding must be rejected");
+            const std::string cross_origin = exchange_http(
+                http_server,
+                "POST /hello HTTP/1.1\r\nHost: localhost:9999\r\n"
+                "Origin: http://evil.example:9999\r\nContent-Length: 0\r\n\r\n");
+            require(
+                cross_origin.find("HTTP/1.1 403 Forbidden") !=
+                        std::string::npos &&
+                    handled_requests == 1,
+                "Cross-origin POST must be rejected before dispatch");
+
+            gitcube::HttpServer throwing_server(
+                "127.0.0.1", 9999, {},
+                [](const gitcube::HttpRequest&) -> gitcube::HttpResponse {
+                    throw std::runtime_error("sensitive diagnostic");
+                },
+                http_shutdown);
+            const std::string exception_response = exchange_http(
+                throwing_server,
+                "GET /boom HTTP/1.1\r\nHost: localhost:9999\r\n\r\n");
+            require(
+                exception_response.find(
+                    "HTTP/1.1 500 Internal Server Error") !=
+                        std::string::npos &&
+                    exception_response.find("sensitive diagnostic") ==
+                        std::string::npos,
+                "HTTP handler exception must produce a generic 500 response");
+        }
+
         std::string json_error;
         const auto json = gitcube::Json::parse(R"({"id":123,"name":"cna","ok":true,"items":[1,2]})", json_error);
         require(json.has_value() && json->is_object(), "JSON object parse failed");
@@ -179,6 +329,29 @@ int main() {
                 std::filesystem::file_time_type::clock::now().time_since_epoch().count())));
         std::filesystem::remove_all(temp);
         std::filesystem::create_directories(temp);
+        if (run_socket_tests) {
+            const auto response_file = temp / "http-response-file";
+            {
+                std::ofstream output(response_file, std::ios::binary);
+                output << "streamed-http-body";
+            }
+            gitcube::HttpServer file_server(
+                "127.0.0.1", 9999, {},
+                [&](const gitcube::HttpRequest&) {
+                    gitcube::HttpResponse response;
+                    response.content_type = "application/octet-stream";
+                    response.body_file = response_file;
+                    response.remove_body_file = true;
+                    return response;
+                },
+                http_shutdown);
+            const std::string file_response = exchange_http(
+                file_server,
+                "GET /file HTTP/1.1\r\nHost: localhost:9999\r\n\r\n");
+            require(file_response.ends_with("streamed-http-body") &&
+                        !std::filesystem::exists(response_file),
+                    "HTTP file response was not streamed and removed");
+        }
         {
             gitcube::DataDirectoryLock first_lock(temp);
             bool second_lock_failed = false;
@@ -230,6 +403,10 @@ SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
         {
             gitcube::Database identity_db(temp / "identity.sqlite3");
             identity_db.initialize();
+            require(query_integer(
+                        temp / "identity.sqlite3",
+                        "SELECT max(version) FROM schema_migrations") == 6,
+                    "Fresh database did not reach the expected schema version");
             const auto punctuation = identity_db.add_repository(*encoded_name);
             const auto underscore = identity_db.add_repository(*underscore_name);
             const auto punctuation_repo =
@@ -242,6 +419,26 @@ SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
                             underscore_repo->storage_relpath,
                     "Distinct URL identities must receive collision-free storage paths");
         }
+        const auto broken_schema_path = temp / "broken-schema.sqlite3";
+        {
+            gitcube::Database broken_fixture(broken_schema_path);
+            broken_fixture.initialize();
+        }
+        execute_sql(broken_schema_path, R"SQL(
+DROP INDEX idx_repositories_canonical_url;
+ALTER TABLE repositories DROP COLUMN canonical_url;
+)SQL");
+        bool broken_schema_rejected = false;
+        try {
+            gitcube::Database broken(broken_schema_path);
+            broken.initialize();
+        } catch (const std::exception& exception) {
+            broken_schema_rejected =
+                std::string(exception.what()).find("canonical_url") !=
+                std::string::npos;
+        }
+        require(broken_schema_rejected,
+                "Schema verification must reject a database falsely claiming v6");
 
         const auto printed = gitcube::ProcessRunner::run({"/usr/bin/printf", "hello"});
         require(printed.exit_code == 0 && printed.output == "hello",

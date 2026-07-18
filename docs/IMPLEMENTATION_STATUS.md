@@ -52,6 +52,11 @@ ports, DNS spelling and percent encoding; GitHub URL aliases/case map to one ind
 canonical key. New mirrors live under `repositories/by-id/<id>.git`, eliminating the
 lossy filename-sanitization collisions while preserving every legacy storage path.
 
+**Continuous integration** — GitHub Actions blocks on GCC Debug/Release, Clang Debug,
+warnings-as-errors, cppcheck, ASan+UBSan, and a gcovr line-coverage floor. CMake exposes
+dedicated warnings/sanitizer/coverage options, all CI builds are capped at two parallel
+tasks, and CTest enforces a per-test timeout.
+
 **Security hardening pass** (found via review, fixed and verified in the same session):
 SVG/HTML/XML raw-blob content-type XSS, a job-queue race allowing duplicate concurrent
 jobs, per-repo job mutual exclusion, interrupted/paused jobs being recorded as permanent
@@ -107,8 +112,8 @@ reload, using a previously-written-but-unused `get_repository_by_url`.
   (e.g. positional-field parsing of `git log`/`ls-tree` output by index rather than by
   name, some duplicated curl-argument construction) — tracked as low-priority polish,
   not correctness issues.
-- No automated check that `kMigrations[]` and `verify_schema()` stay in sync as new
-  columns are added — currently a documented convention (see README's "Database schema
-  and migrations"), not an enforced one.
+- The compact test suite still uses a dependency-free assertion harness rather than a
+  richer parameterized/fuzzing framework; security-sensitive parsers have targeted
+  regression cases, but broader fuzzing remains useful future work.
 - Windows/macOS untested and unsupported; the process/signal/socket layer is
   POSIX-specific by design for now.

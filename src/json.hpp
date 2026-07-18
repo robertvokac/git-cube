@@ -31,7 +31,7 @@ public:
     bool boolean(bool fallback = false) const;
     std::int64_t integer(std::int64_t fallback = 0) const;
     double number(double fallback = 0.0) const;
-    std::string string(std::string fallback = {}) const;
+    std::string string(const std::string& fallback = {}) const;
     const Array& array() const;
     const Object& object() const;
     const Json* get(std::string_view key) const;

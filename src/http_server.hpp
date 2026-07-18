@@ -16,6 +16,8 @@
 
 namespace gitcube {
 
+struct HttpServerTestAccess;
+
 struct HttpRequest {
     std::string method;
     std::string target;
@@ -68,6 +70,8 @@ public:
     void request_stop();
 
 private:
+    friend struct HttpServerTestAccess;
+
     std::string bind_address_;
     int port_;
     std::vector<std::string> allowed_hosts_;

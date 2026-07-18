@@ -31,7 +31,8 @@ std::optional<std::int64_t> parse_id(const std::smatch& match, std::size_t index
     try { return std::stoll(match[index].str()); } catch (...) { return std::nullopt; }
 }
 
-std::string query_value(const HttpRequest& request, const std::string& key, std::string fallback = {}) {
+std::string query_value(const HttpRequest& request, const std::string& key,
+                        const std::string& fallback = {}) {
     const auto values = parse_query(request.query_string);
     const auto it = values.find(key);
     return it == values.end() ? fallback : it->second;

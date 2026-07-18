@@ -337,7 +337,7 @@ double Json::number(double fallback) const {
     return fallback;
 }
 
-std::string Json::string(std::string fallback) const {
+std::string Json::string(const std::string& fallback) const {
     if (const auto* value = std::get_if<std::string>(&value_)) return *value;
     return fallback;
 }
