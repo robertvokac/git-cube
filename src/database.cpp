@@ -11,11 +11,18 @@ namespace {
 
 // Ordered, additive schema migrations. Each entry's `sql` is applied once, in a single
 // transaction, when the database's current version is below `version`; the version is
-// then recorded in schema_migrations. To change the schema in the future, append a new
-// entry here — never edit an already-released one — so both fresh databases (which start
-// from the CREATE TABLE statements in Database::initialize() reflecting the *latest*
-// schema) and upgraded databases (which replay every migration newer than their current
-// version) converge on the same result.
+// then recorded in schema_migrations. run_pending_migrations() runs unconditionally after
+// the CREATE TABLE statements below, on every database, fresh or old — so a brand-new
+// database ends up at the latest schema by executing this same list, not by the CREATE
+// TABLE statements already containing it.
+//
+// This means the CREATE TABLE statements in Database::initialize() are a frozen v1
+// snapshot and must NEVER be hand-edited to add a column a migration is responsible for.
+// Doing that once already caused a real bug: a fresh database and an upgraded database
+// would apply the migrations starting from different starting schemas, and at least one
+// migration (an unconditional ALTER TABLE ADD COLUMN) then failed on a fresh database
+// with "duplicate column name" because the column was already there. To add a column,
+// append a new {version, sql} entry below — never touch the CREATE TABLE block.
 struct Migration {
     int version;
     const char* sql;
@@ -162,6 +169,33 @@ void run_pending_migrations(Connection& db) {
     }
 }
 
+// Regression guard for exactly the bug class that motivated the comment above kMigrations:
+// a CREATE TABLE/migration mismatch that leaves some database (fresh or upgraded) missing
+// a column the rest of this file assumes exists. Rather than surfacing as a "no such
+// column" from whichever query happens to run first — at some arbitrary point after
+// startup, on some arbitrary request — fail loudly here, immediately, with the specific
+// table and column named.
+void verify_schema(Connection& db) {
+    auto has_column = [&](const char* table, const char* column) {
+        Statement stmt(db.get(), std::string("SELECT 1 FROM pragma_table_info(?) WHERE name = ?"));
+        stmt.bind(1, std::string(table));
+        stmt.bind(2, std::string(column));
+        return stmt.step_row();
+    };
+    auto require_columns = [&](const char* table, std::initializer_list<const char*> columns) {
+        for (const char* column : columns) {
+            if (!has_column(table, column)) {
+                throw std::runtime_error(std::string("Database schema check failed: table '") + table +
+                                         "' is missing column '" + column + "'. gitcube.sqlite3 may predate a "
+                                         "schema migration that failed to apply; check the startup log above "
+                                         "this error for the actual migration failure.");
+            }
+        }
+    };
+    require_columns("repositories", {"id", "storage_relpath", "importance", "branch_count", "tag_count", "object_count"});
+    require_columns("jobs", {"id", "repo_id", "type", "status", "payload", "scheduled_at", "attempts"});
+}
+
 Repository read_repository(Statement& stmt) {
     Repository r;
     int c = 0;
@@ -265,6 +299,8 @@ Database::Database(std::filesystem::path path) : path_(std::move(path)) {}
 void Database::initialize() {
     std::filesystem::create_directories(path_.parent_path());
     Connection db(path_);
+    // Frozen v1 schema — do not add columns here. See the kMigrations comment above:
+    // every column added since v1 belongs exclusively in that list.
     db.exec(R"SQL(
 CREATE TABLE IF NOT EXISTS repositories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -355,6 +391,7 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime(
     // database file it's a no-op even when the schema it describes has moved on since
     // that file was created. Bring such a database up to date explicitly.
     run_pending_migrations(db);
+    verify_schema(db);
 }
 
 void Database::recover_interrupted_jobs() {
