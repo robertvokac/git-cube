@@ -1,5 +1,6 @@
 #include "application.hpp"
 
+#include "favicon_assets.hpp"
 #include "util.hpp"
 
 #include <algorithm>
@@ -185,6 +186,19 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
     if (request.method == "GET" && request.path == "/add") return add_repositories_page();
     if (request.method == "GET" && request.path == "/jobs") return jobs_page();
     if (request.method == "GET" && request.path == "/api/status") return api_status();
+    if (request.method == "GET" && request.path == "/favicon.svg") {
+        return {200, "image/svg+xml", std::string(kFaviconSvg), {{"Cache-Control", "public, max-age=604800"}}};
+    }
+    if (request.method == "GET" && request.path == "/favicon.ico") {
+        return {200, "image/vnd.microsoft.icon",
+               std::string(reinterpret_cast<const char*>(kFaviconIcoData), kFaviconIcoData_size),
+               {{"Cache-Control", "public, max-age=604800"}}};
+    }
+    if (request.method == "GET" && request.path == "/apple-touch-icon.png") {
+        return {200, "image/png",
+               std::string(reinterpret_cast<const char*>(kAppleTouchIconPngData), kAppleTouchIconPngData_size),
+               {{"Cache-Control", "public, max-age=604800"}}};
+    }
     if (request.method == "POST" && request.path == "/import") return import_repositories(request);
     if (request.method == "POST" && request.path == "/fetch-all") return enqueue_bulk(request, "fetch");
     if (request.method == "POST" && request.path == "/health-all") return enqueue_bulk(request, "health");
@@ -220,6 +234,9 @@ std::string Application::page(std::string_view title, std::string_view body) con
     out << R"HTML(<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>)HTML" << html_escape(title) << R"HTML( · GitCube</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/vnd.microsoft.icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>
 :root{color-scheme:light;--bg:#f3ead9;--panel:#faf5ea;--panel2:#e8dab5;--input:#fffdf6;--chip:#efe4c8;--text:#3b2f22;--muted:#8a7358;--line:#ddc9a3;--link:#8a5a2b;--ok:#4f7d4a;--bad:#a83f34;--busy:#b4791f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,sans-serif}header{background:var(--panel2);border-bottom:1px solid var(--line);padding:14px 24px;display:flex;gap:24px;align-items:center}header strong{font-size:21px}header a{color:var(--text);text-decoration:none}.wrap{max-width:1440px;margin:auto;padding:24px}a{color:var(--link)}section,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:0 0 18px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:18px}.stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}.stat b{display:block;font-size:27px}.muted{color:var(--muted)}table{width:100%;border-collapse:collapse}th,td{text-align:left;border-bottom:1px solid var(--line);padding:10px 8px;vertical-align:top}th{color:var(--muted);font-size:12px;text-transform:uppercase}textarea,input,select{width:100%;background:var(--input);color:var(--text);border:1px solid var(--line);border-radius:7px;padding:10px}button,.button{display:inline-block;background:var(--link);color:white;border:0;border-radius:7px;padding:9px 13px;text-decoration:none;cursor:pointer;font-weight:600}.secondary{background:var(--chip);color:var(--text)}.danger{background:var(--bad);color:white}.actions{display:flex;flex-wrap:wrap;gap:8px}.actions form{display:inline}.filters{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-end;margin-bottom:14px}.filters label{display:block;font-size:12px;color:var(--muted);text-transform:uppercase;margin-bottom:4px}.filters .field{min-width:160px}.pagination{display:flex;gap:10px;align-items:center;justify-content:space-between;margin-top:14px}.badge{display:inline-block;padding:3px 8px;border-radius:999px;background:var(--chip);font-size:12px}.badge.ok{color:var(--ok)}.badge.bad{color:var(--bad)}.badge.busy{color:var(--busy)}code{background:var(--chip);border:1px solid var(--line);border-radius:4px;padding:1px 4px}pre{overflow:auto;background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:14px;white-space:pre}pre code{border:0;padding:0}.markdown{max-width:1000px}.markdown img{max-width:100%;height:auto}.markdown blockquote{border-left:4px solid var(--line);margin-left:0;padding-left:16px;color:var(--muted)}.notice{border-color:#7fa66a;background:#eef3df}.error{border-color:#c96a56;background:#fbeadf}.repo-name{font-weight:700}.path{font-family:ui-monospace,monospace}.right{text-align:right}.nowrap{white-space:nowrap}details pre{max-height:500px}.tabs{display:flex;gap:14px;margin:12px 0}.tabs a{text-decoration:none}.description{max-width:700px}.repo-header{display:flex;justify-content:space-between;gap:20px;align-items:flex-start}.repo-header h1{margin-top:0}@media(max-width:800px){.wrap{padding:12px}.repo-header{display:block}table{display:block;overflow:auto}}
 </style></head><body><header><a href="/"><strong>GitCube</strong></a><a href="/">Repositories</a><a href="/add">Add repository</a><a href="/jobs">Jobs</a><span class="muted">local public Git mirror</span></header><main class="wrap">)HTML"

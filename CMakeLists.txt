@@ -16,6 +16,7 @@ add_library(gitcube_core
     src/git_service.cpp
     src/http_server.cpp
     src/application.cpp
+    src/favicon_assets.cpp
 )
 
 target_include_directories(gitcube_core PUBLIC src)
