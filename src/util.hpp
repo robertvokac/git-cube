@@ -17,7 +17,6 @@ struct ParsedRepositoryUrl {
     std::string host;
     std::string owner;
     std::string name;
-    std::filesystem::path relative_storage_path;
     bool github = false;
 };
 

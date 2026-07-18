@@ -77,6 +77,10 @@ UPDATE repositories SET
    ELSE status
  END;
 )SQL"},
+    {6, R"SQL(
+ALTER TABLE repositories ADD COLUMN canonical_url TEXT NOT NULL DEFAULT '';
+CREATE INDEX idx_repositories_canonical_url ON repositories(canonical_url);
+)SQL"},
 };
 
 
@@ -216,11 +220,42 @@ void verify_schema(Connection& db) {
             }
         }
     };
-    require_columns("repositories", {"id", "storage_relpath", "importance", "operation",
+    require_columns("repositories", {"id", "storage_relpath", "canonical_url",
+                                      "importance", "operation",
                                       "health_status", "health_error", "metadata_status",
                                       "metadata_error", "branch_count", "tag_count",
                                       "object_count"});
     require_columns("jobs", {"id", "repo_id", "type", "status", "payload", "scheduled_at", "attempts"});
+}
+
+void backfill_canonical_repository_urls(Connection& db) {
+    std::vector<std::pair<std::int64_t, std::string>> pending;
+    {
+        Statement select(db.get(),
+            "SELECT id, normalized_url FROM repositories WHERE canonical_url=''");
+        while (select.step_row()) {
+            pending.emplace_back(select.integer(0), select.text(1));
+        }
+    }
+    if (pending.empty()) return;
+
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        Statement update(db.get(),
+            "UPDATE repositories SET canonical_url=? WHERE id=? AND canonical_url=''");
+        for (const auto& [id, legacy_url] : pending) {
+            std::string parse_error;
+            const auto parsed = parse_repository_url(legacy_url, parse_error);
+            update.bind(1, parsed ? parsed->normalized : legacy_url);
+            update.bind(2, id);
+            update.step_done();
+            update.reset();
+        }
+        db.exec("COMMIT;");
+    } catch (...) {
+        db.exec("ROLLBACK;");
+        throw;
+    }
 }
 
 Repository read_repository(Statement& stmt) {
@@ -325,6 +360,10 @@ bool enqueue_job_locked(sqlite3* db, std::optional<std::int64_t> repo_id, const 
     return true;
 }
 
+std::string repository_storage_path(std::int64_t id) {
+    return "repositories/by-id/" + std::to_string(id) + ".git";
+}
+
 } // namespace
 
 Database::Database(std::filesystem::path path) : path_(std::move(path)) {}
@@ -425,6 +464,7 @@ INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(1, datetime(
     // that file was created. Bring such a database up to date explicitly.
     run_pending_migrations(db);
     verify_schema(db);
+    backfill_canonical_repository_urls(db);
 }
 
 void Database::recover_interrupted_jobs() {
@@ -442,29 +482,53 @@ void Database::recover_interrupted_jobs() {
 
 AddRepositoryResult Database::add_repository(const ParsedRepositoryUrl& parsed) {
     Connection db(path_);
-    Statement insert(db.get(), R"SQL(
-INSERT OR IGNORE INTO repositories(
- original_url, normalized_url, host, owner, name, storage_relpath, status,
- paused, is_github, inserted_at, modified_at
-) VALUES(?,?,?,?,?,?,'queued',0,?,?,?)
-)SQL");
-    insert.bind(1, parsed.original);
-    insert.bind(2, parsed.normalized);
-    insert.bind(3, parsed.host);
-    insert.bind(4, parsed.owner);
-    insert.bind(5, parsed.name);
-    insert.bind(6, parsed.relative_storage_path.generic_string());
-    insert.bind(7, parsed.github ? 1 : 0);
-    const auto now = now_utc();
-    insert.bind(8, now);
-    insert.bind(9, now);
-    insert.step_done();
-    const bool created = sqlite3_changes(db.get()) > 0;
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        std::optional<std::int64_t> existing_id;
+        {
+            Statement existing(db.get(),
+                "SELECT id FROM repositories "
+                "WHERE canonical_url=? OR normalized_url=? ORDER BY id LIMIT 1");
+            existing.bind(1, parsed.normalized);
+            existing.bind(2, parsed.normalized);
+            if (existing.step_row()) existing_id = existing.integer(0);
+        }
+        if (existing_id) {
+            db.exec("COMMIT;");
+            return {*existing_id, false};
+        }
 
-    Statement select(db.get(), "SELECT id FROM repositories WHERE normalized_url=?");
-    select.bind(1, parsed.normalized);
-    if (!select.step_row()) throw std::runtime_error("Repository insert/select failed");
-    return {select.integer(0), created};
+        Statement insert(db.get(), R"SQL(
+INSERT INTO repositories(
+ original_url, normalized_url, canonical_url, host, owner, name, storage_relpath,
+ status, paused, is_github, inserted_at, modified_at
+) VALUES(?,?,?,?,?,?,'repositories/.pending/' || lower(hex(randomblob(16))),
+         'queued',0,?,?,?)
+)SQL");
+        insert.bind(1, parsed.original);
+        insert.bind(2, parsed.normalized);
+        insert.bind(3, parsed.normalized);
+        insert.bind(4, parsed.host);
+        insert.bind(5, parsed.owner);
+        insert.bind(6, parsed.name);
+        insert.bind(7, parsed.github ? 1 : 0);
+        const auto now = now_utc();
+        insert.bind(8, now);
+        insert.bind(9, now);
+        insert.step_done();
+        const std::int64_t id = sqlite3_last_insert_rowid(db.get());
+
+        Statement storage(db.get(),
+            "UPDATE repositories SET storage_relpath=? WHERE id=?");
+        storage.bind(1, repository_storage_path(id));
+        storage.bind(2, id);
+        storage.step_done();
+        db.exec("COMMIT;");
+        return {id, true};
+    } catch (...) {
+        db.exec("ROLLBACK;");
+        throw;
+    }
 }
 
 std::vector<ImportedRepository> Database::import_repositories(const std::vector<ParsedRepositoryUrl>& parsed_urls) {
@@ -473,36 +537,51 @@ std::vector<ImportedRepository> Database::import_repositories(const std::vector<
     Connection db(path_);
     db.exec("BEGIN IMMEDIATE;");
     try {
+        Statement existing(db.get(),
+            "SELECT id, storage_relpath FROM repositories "
+            "WHERE canonical_url=? OR normalized_url=? ORDER BY id LIMIT 1");
         Statement insert(db.get(), R"SQL(
-INSERT OR IGNORE INTO repositories(
- original_url, normalized_url, host, owner, name, storage_relpath, status,
- paused, is_github, inserted_at, modified_at
-) VALUES(?,?,?,?,?,?,'queued',0,?,?,?)
+INSERT INTO repositories(
+ original_url, normalized_url, canonical_url, host, owner, name, storage_relpath,
+ status, paused, is_github, inserted_at, modified_at
+) VALUES(?,?,?,?,?,?,'repositories/.pending/' || lower(hex(randomblob(16))),
+         'queued',0,?,?,?)
 )SQL");
-        Statement select(db.get(), "SELECT id, storage_relpath FROM repositories WHERE normalized_url=?");
+        Statement storage(db.get(),
+            "UPDATE repositories SET storage_relpath=? WHERE id=?");
         const auto now = now_utc();
         for (const auto& parsed : parsed_urls) {
+            existing.bind(1, parsed.normalized);
+            existing.bind(2, parsed.normalized);
+            if (existing.step_row()) {
+                results.push_back(
+                    {existing.integer(0), false, existing.text(1)});
+                existing.reset();
+                continue;
+            }
+            existing.reset();
+
             insert.bind(1, parsed.original);
             insert.bind(2, parsed.normalized);
-            insert.bind(3, parsed.host);
-            insert.bind(4, parsed.owner);
-            insert.bind(5, parsed.name);
-            insert.bind(6, parsed.relative_storage_path.generic_string());
+            insert.bind(3, parsed.normalized);
+            insert.bind(4, parsed.host);
+            insert.bind(5, parsed.owner);
+            insert.bind(6, parsed.name);
             insert.bind(7, parsed.github ? 1 : 0);
             insert.bind(8, now);
             insert.bind(9, now);
             insert.step_done();
-            const bool created = sqlite3_changes(db.get()) > 0;
+            const std::int64_t id = sqlite3_last_insert_rowid(db.get());
             insert.reset();
 
-            select.bind(1, parsed.normalized);
-            if (!select.step_row()) throw std::runtime_error("Repository insert/select failed");
-            const std::int64_t id = select.integer(0);
-            std::string storage_relpath = select.text(1);
-            select.reset();
+            const std::string storage_relpath = repository_storage_path(id);
+            storage.bind(1, storage_relpath);
+            storage.bind(2, id);
+            storage.step_done();
+            storage.reset();
 
-            if (created) enqueue_job_locked(db.get(), id, "clone", "Imported from web UI", {});
-            results.push_back({id, created, std::move(storage_relpath)});
+            enqueue_job_locked(db.get(), id, "clone", "Imported from web UI", {});
+            results.push_back({id, true, storage_relpath});
         }
         db.exec("COMMIT;");
     } catch (...) {
@@ -577,8 +656,10 @@ std::optional<Repository> Database::get_repository(std::int64_t id) const {
 
 std::optional<Repository> Database::get_repository_by_url(const std::string& normalized_url) const {
     Connection db(path_);
-    Statement stmt(db.get(), std::string("SELECT ") + repository_columns + " FROM repositories WHERE normalized_url=?");
+    Statement stmt(db.get(), std::string("SELECT ") + repository_columns +
+        " FROM repositories WHERE canonical_url=? OR normalized_url=? ORDER BY id LIMIT 1");
     stmt.bind(1, normalized_url);
+    stmt.bind(2, normalized_url);
     if (!stmt.step_row()) return std::nullopt;
     return read_repository(stmt);
 }

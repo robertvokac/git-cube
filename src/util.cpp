@@ -1,5 +1,7 @@
 #include "util.hpp"
 
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -11,20 +13,145 @@
 namespace gitcube {
 namespace {
 
-std::string sanitize_segment(std::string_view value) {
+bool ascii_alnum(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9');
+}
+
+std::optional<std::string> decode_url_path_segment(std::string_view value) {
     std::string out;
     out.reserve(value.size());
-    for (const unsigned char c : value) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.') {
+    auto hex_value = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        unsigned char decoded = static_cast<unsigned char>(value[i]);
+        if (value[i] == '%') {
+            if (i + 2 >= value.size()) return std::nullopt;
+            const int hi = hex_value(value[i + 1]);
+            const int lo = hex_value(value[i + 2]);
+            if (hi < 0 || lo < 0) return std::nullopt;
+            decoded = static_cast<unsigned char>((hi << 4) | lo);
+            i += 2;
+        }
+        if (decoded == 0 || decoded < 0x20 || decoded == 0x7f ||
+            decoded == '/' || decoded == '\\') {
+            return std::nullopt;
+        }
+        out.push_back(static_cast<char>(decoded));
+    }
+    if (out.empty() || out == "." || out == "..") return std::nullopt;
+    return out;
+}
+
+std::string encode_url_path_segment(std::string_view value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (ascii_alnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
             out.push_back(static_cast<char>(c));
         } else {
-            out.push_back('_');
+            out.push_back('%');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 0x0f]);
         }
     }
-    if (out.empty() || out == "." || out == "..") {
-        return "_";
-    }
     return out;
+}
+
+struct ParsedAuthority {
+    std::string host;
+    std::string authority;
+    bool nondefault_port = false;
+};
+
+std::optional<ParsedAuthority> parse_authority(std::string_view raw_authority,
+                                               std::string_view scheme) {
+    if (raw_authority.empty() || raw_authority.find('@') != std::string_view::npos) {
+        return std::nullopt;
+    }
+
+    std::string host;
+    std::string port;
+    if (raw_authority.front() == '[') {
+        const auto close = raw_authority.find(']');
+        if (close == std::string_view::npos) return std::nullopt;
+        host = to_lower(std::string(raw_authority.substr(0, close + 1)));
+        if (close + 1 < raw_authority.size()) {
+            if (raw_authority[close + 1] != ':') return std::nullopt;
+            port = std::string(raw_authority.substr(close + 2));
+        }
+        if (host.size() <= 2) return std::nullopt;
+        const std::string address = host.substr(1, host.size() - 2);
+        in6_addr parsed_address{};
+        if (inet_pton(AF_INET6, address.c_str(), &parsed_address) != 1) {
+            return std::nullopt;
+        }
+        std::array<char, INET6_ADDRSTRLEN> canonical_address{};
+        if (!inet_ntop(AF_INET6, &parsed_address, canonical_address.data(),
+                       static_cast<socklen_t>(canonical_address.size()))) {
+            return std::nullopt;
+        }
+        host = "[" + to_lower(canonical_address.data()) + "]";
+    } else {
+        const auto colon = raw_authority.rfind(':');
+        if (colon != std::string_view::npos) {
+            if (raw_authority.find(':') != colon) return std::nullopt;
+            host = to_lower(std::string(raw_authority.substr(0, colon)));
+            port = std::string(raw_authority.substr(colon + 1));
+        } else {
+            host = to_lower(std::string(raw_authority));
+        }
+        while (!host.empty() && host.back() == '.') host.pop_back();
+        if (host.empty() || host.size() > 253 || host.front() == '.' ||
+            host.find("..") != std::string::npos) {
+            return std::nullopt;
+        }
+        for (const char raw : host) {
+            const auto c = static_cast<unsigned char>(raw);
+            if (!ascii_alnum(c) && c != '-' && c != '.') return std::nullopt;
+        }
+        std::size_t label_start = 0;
+        while (label_start < host.size()) {
+            const auto dot = host.find('.', label_start);
+            const std::size_t label_end =
+                dot == std::string::npos ? host.size() : dot;
+            const std::size_t label_size = label_end - label_start;
+            if (label_size == 0 || label_size > 63 ||
+                host[label_start] == '-' || host[label_end - 1] == '-') {
+                return std::nullopt;
+            }
+            if (dot == std::string::npos) break;
+            label_start = dot + 1;
+        }
+    }
+
+    int port_number = 0;
+    if (!port.empty()) {
+        if (port.size() > 5) return std::nullopt;
+        for (const char raw : port) {
+            const auto c = static_cast<unsigned char>(raw);
+            if (!std::isdigit(c)) return std::nullopt;
+            port_number = port_number * 10 + (c - '0');
+        }
+        if (port_number < 1 || port_number > 65535) return std::nullopt;
+    } else if (raw_authority.back() == ':') {
+        return std::nullopt;
+    }
+
+    const bool default_port =
+        (scheme == "http" && port_number == 80) ||
+        (scheme == "https" && port_number == 443);
+    ParsedAuthority parsed;
+    parsed.host = std::move(host);
+    parsed.nondefault_port = port_number != 0 && !default_port;
+    parsed.authority = parsed.host;
+    if (parsed.nondefault_port) parsed.authority += ":" + std::to_string(port_number);
+    return parsed;
 }
 
 std::string inline_markdown(std::string_view text, std::string_view raw_base_url) {
@@ -153,7 +280,8 @@ std::string html_escape(std::string_view value) {
 
 std::string json_escape(std::string_view value) {
     std::ostringstream out;
-    for (const unsigned char c : value) {
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
         switch (c) {
             case '"': out << "\\\""; break;
             case '\\': out << "\\\\"; break;
@@ -176,8 +304,9 @@ std::string json_escape(std::string_view value) {
 std::string url_encode(std::string_view value) {
     static constexpr char hex[] = "0123456789ABCDEF";
     std::string out;
-    for (const unsigned char c : value) {
-        if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (ascii_alnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
             out.push_back(static_cast<char>(c));
         } else {
             out.push_back('%');
@@ -237,6 +366,7 @@ std::map<std::string, std::string> parse_query(std::string_view value) {
 }
 
 std::optional<ParsedRepositoryUrl> parse_repository_url(std::string_view input, std::string& error) {
+    error.clear();
     std::string url = trim(input);
     if (url.empty()) {
         error = "Empty URL";
@@ -246,7 +376,7 @@ std::optional<ParsedRepositoryUrl> parse_repository_url(std::string_view input, 
         error = "URL is too long";
         return std::nullopt;
     }
-    const std::regex pattern(R"(^(https?)://([^/?#]+)(/[^?#]*)/?$)", std::regex::icase);
+    const std::regex pattern(R"(^(https?)://([^/?#]+)(/[^?#]*)$)", std::regex::icase);
     std::smatch match;
     if (!std::regex_match(url, match, pattern)) {
         error = "Only public http:// or https:// repository URLs are supported";
@@ -255,15 +385,15 @@ std::optional<ParsedRepositoryUrl> parse_repository_url(std::string_view input, 
     ParsedRepositoryUrl parsed;
     parsed.original = url;
     parsed.scheme = to_lower(match[1].str());
-    parsed.host = to_lower(match[2].str());
-    if (parsed.host.find('@') != std::string::npos) {
-        error = "Credentials in repository URLs are not allowed";
+    const auto authority = parse_authority(match[2].str(), parsed.scheme);
+    if (!authority) {
+        error = "Repository URL has an invalid host, credentials, or port";
         return std::nullopt;
     }
+    parsed.host = authority->authority;
     std::string path = match[3].str();
-    while (!path.empty() && path.front() == '/') path.erase(path.begin());
+    if (!path.empty() && path.front() == '/') path.erase(path.begin());
     while (!path.empty() && path.back() == '/') path.pop_back();
-    if (path.ends_with(".git")) path.resize(path.size() - 4);
     if (path.empty()) {
         error = "Repository path is missing";
         return std::nullopt;
@@ -273,17 +403,14 @@ std::optional<ParsedRepositoryUrl> parse_repository_url(std::string_view input, 
     std::size_t start = 0;
     while (start <= path.size()) {
         const auto slash = path.find('/', start);
-        std::string segment = path.substr(start, slash == std::string::npos ? path.size() - start : slash - start);
-        segment = url_decode(segment);
-        if (segment.empty() || segment == "." || segment == ".." || segment.find('\0') != std::string::npos ||
-            segment.find('/') != std::string::npos) {
-            // A literal '/' can only appear here if the raw URL smuggled it in as '%2F',
-            // which must not be allowed to silently expand into extra path segments after
-            // the segment count (e.g. GitHub's owner/name check) has already been decided.
+        const std::string_view raw_segment = std::string_view(path).substr(
+            start, (slash == std::string::npos ? path.size() : slash) - start);
+        auto decoded = decode_url_path_segment(raw_segment);
+        if (!decoded) {
             error = "Invalid repository path";
             return std::nullopt;
         }
-        segments.push_back(segment);
+        segments.push_back(std::move(*decoded));
         if (slash == std::string::npos) break;
         start = slash + 1;
     }
@@ -292,33 +419,53 @@ std::optional<ParsedRepositoryUrl> parse_repository_url(std::string_view input, 
         return std::nullopt;
     }
 
+    if (segments.back().size() >= 4 &&
+        to_lower(segments.back().substr(segments.back().size() - 4)) == ".git") {
+        segments.back().resize(segments.back().size() - 4);
+        if (segments.back().empty()) {
+            error = "Repository name is missing";
+            return std::nullopt;
+        }
+    }
+
+    const bool github_host =
+        !authority->nondefault_port &&
+        (authority->host == "github.com" || authority->host == "www.github.com");
+    parsed.github = github_host;
+    if (parsed.github) {
+        if (segments.size() != 2) {
+            error = "GitHub repository URL must have the form github.com/owner/repository";
+            return std::nullopt;
+        }
+        for (std::string& segment : segments) {
+            if (segment.size() > 100) {
+                error = "GitHub owner or repository name is too long";
+                return std::nullopt;
+            }
+            for (const char raw : segment) {
+                const auto c = static_cast<unsigned char>(raw);
+                if (!ascii_alnum(c) && c != '-' && c != '_' && c != '.') {
+                    error = "GitHub owner or repository name contains invalid characters";
+                    return std::nullopt;
+                }
+            }
+            segment = to_lower(std::move(segment));
+        }
+        parsed.scheme = "https";
+        parsed.host = "github.com";
+    }
+
     parsed.name = segments.back();
     parsed.owner.clear();
     for (std::size_t i = 0; i + 1 < segments.size(); ++i) {
         if (!parsed.owner.empty()) parsed.owner += '/';
         parsed.owner += segments[i];
     }
-    parsed.github = parsed.host == "github.com" || parsed.host == "www.github.com";
-    if (parsed.host == "www.github.com") parsed.host = "github.com";
-    if (parsed.github && segments.size() != 2) {
-        error = "GitHub repository URL must have the form github.com/owner/repository";
-        return std::nullopt;
-    }
-
     std::string normalized_path;
     for (const auto& segment : segments) {
-        normalized_path += "/" + segment;
+        normalized_path += "/" + encode_url_path_segment(segment);
     }
     parsed.normalized = parsed.scheme + "://" + parsed.host + normalized_path + ".git";
-
-    std::filesystem::path rel = "repositories";
-    rel /= sanitize_segment(parsed.host);
-    for (std::size_t i = 0; i < segments.size(); ++i) {
-        std::string segment = sanitize_segment(segments[i]);
-        if (i + 1 == segments.size()) segment += ".git";
-        rel /= segment;
-    }
-    parsed.relative_storage_path = rel;
     return parsed;
 }
 
@@ -333,10 +480,11 @@ std::optional<std::string> parse_github_account_url(std::string_view input) {
     if (account.empty() || account.size() > 100 || account.front() == '-' || account.back() == '-') {
         return std::nullopt;
     }
-    for (const unsigned char c : account) {
-        if (!std::isalnum(c) && c != '-') return std::nullopt;
+    for (const char raw : account) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (!ascii_alnum(c) && c != '-') return std::nullopt;
     }
-    return account;
+    return to_lower(account);
 }
 
 bool valid_git_ref(std::string_view ref) {
@@ -344,7 +492,8 @@ bool valid_git_ref(std::string_view ref) {
         ref.find("..") != std::string_view::npos || ref.find("@{") != std::string_view::npos) {
         return false;
     }
-    for (const unsigned char c : ref) {
+    for (const char raw : ref) {
+        const auto c = static_cast<unsigned char>(raw);
         if (c < 0x20 || c == 0x7f || c == ' ' || c == '~' || c == '^' || c == ':' || c == '?' || c == '*' || c == '[' || c == '\\') {
             return false;
         }
@@ -356,7 +505,8 @@ bool valid_repo_path(std::string_view path) {
     if (path.size() > 4096 || path.starts_with('/') || path.find('\0') != std::string_view::npos || path.find('\\') != std::string_view::npos) {
         return false;
     }
-    for (const unsigned char c : path) {
+    for (const char raw : path) {
+        const auto c = static_cast<unsigned char>(raw);
         if (c < 0x20 || c == 0x7f) return false;
     }
     std::size_t start = 0;

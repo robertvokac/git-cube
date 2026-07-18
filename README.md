@@ -117,6 +117,12 @@ page, whether GitCube already has it — and jump straight to it if so.
 SSH URLs, embedded credentials and any non-`http(s)` scheme are rejected at parse time,
 both here and everywhere else a URL is accepted.
 
+URL identity is canonicalized before lookup: host names are lowercase, a trailing DNS
+dot and default `:80`/`:443` ports are removed, percent escapes are decoded and
+re-encoded consistently, and GitHub's `http`/`https`, `www`, path case, trailing slash,
+and `.git` variants resolve to one repository. Malformed escapes, credentials, invalid
+ports, empty path segments, and encoded `/` or `\` separators are rejected.
+
 ### The repository list
 
 The home page (**Repositories**) lists every known repository, 25 per page, with:
@@ -328,7 +334,7 @@ data/
 ├── gitcube.sqlite3          # WAL mode; repositories, jobs, refs, releases, schema_migrations
 ├── gitcube.lock             # held exclusively for the lifetime of the process
 ├── repositories/
-│   └── github.com/openeggbert/cna.git/   # bare mirror, no worktree
+│   └── by-id/42.git/         # collision-free bare mirror, no worktree
 ├── tmp/                      # atomic clone staging and short-lived streamed exports
 ├── cache/
 └── logs/
@@ -338,6 +344,10 @@ A clone is written to `data/tmp/clone-<repo>-<job>.git` and only `rename()`d int
 final path after `git clone --mirror` exits successfully — an interrupted clone can
 never appear as a completed repository, and any leftover staging directory found in
 `data/tmp` at startup (from a hard crash) is removed automatically.
+
+New mirrors use the database repository ID in their path, so two distinct URL segments
+can never collide after filename sanitization. Paths created by older GitCube versions
+are retained in place and continue to be read from their stored `storage_relpath`.
 
 The data directory and newly created contents are owner-only by default. A process-wide
 `gitcube.lock` prevents two instances from recovering or executing the same queue.
@@ -354,6 +364,7 @@ const Migration kMigrations[] = {
     {3, "ALTER TABLE jobs ADD COLUMN scheduled_at TEXT NOT NULL DEFAULT '';"},
     {4, "ALTER TABLE repositories ADD COLUMN importance INTEGER NOT NULL DEFAULT 0;"},
     {5, R"SQL( ... )SQL"},   // separates availability, operation, health and metadata state
+    {6, R"SQL( ... )SQL"},   // adds indexed canonical URL identity for legacy rows
 };
 ```
 
@@ -388,8 +399,10 @@ happens to run first.
 - Child processes receive a controlled environment: global/system Git configuration,
   credential helpers, Git prompting, `.curlrc`, and `ZIPOPT` cannot silently change the
   public-HTTP-only behavior or corrupt binary output.
-- Repository URLs are restricted to public `http://`/`https://`, with credentials and
-  any other scheme rejected at parse time (`parse_repository_url` in `util.cpp`).
+- Repository URLs are restricted to public `http://`/`https://`, with credentials,
+  malformed host/port/path encoding, and any other scheme rejected at parse time
+  (`parse_repository_url` in `util.cpp`). Canonical identity prevents equivalent URL
+  spellings from creating duplicate records.
 - Ref names and repository-relative paths are validated (`valid_git_ref`,
   `valid_repo_path`) before being passed to `git`, blocking traversal (`..`), leading
   `-` (option injection), and control characters.

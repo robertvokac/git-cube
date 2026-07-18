@@ -49,8 +49,55 @@ int main() {
         require(github->host == "github.com", "GitHub host normalization failed");
         require(github->owner == "openeggbert", "GitHub owner parse failed");
         require(github->name == "cna", "GitHub name parse failed");
-        require(github->relative_storage_path.generic_string() == "repositories/github.com/openeggbert/cna.git",
-                "Storage path parse failed");
+        require(github->normalized == "https://github.com/openeggbert/cna.git",
+                "GitHub URL normalization failed");
+
+        const auto github_variant = gitcube::parse_repository_url(
+            "http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/", error);
+        require(github_variant &&
+                    github_variant->normalized == github->normalized,
+                "Equivalent GitHub URL variants must have one canonical identity");
+        const auto default_https_port = gitcube::parse_repository_url(
+            "https://github.com:443/openeggbert/cna", error);
+        require(default_https_port &&
+                    default_https_port->normalized == github->normalized,
+                "Default HTTPS port should not change repository identity");
+
+        const auto encoded_name = gitcube::parse_repository_url(
+            "https://Example.COM.:443/group/a%3Ab.git", error);
+        const auto underscore_name = gitcube::parse_repository_url(
+            "https://example.com/group/a_b.git", error);
+        require(encoded_name && underscore_name &&
+                    encoded_name->normalized ==
+                        "https://example.com/group/a%3Ab.git" &&
+                    encoded_name->normalized != underscore_name->normalized,
+                "Percent-encoded repository names must normalize without collisions");
+        const auto plus_name = gitcube::parse_repository_url(
+            "https://example.com/group/a+b", error);
+        require(plus_name &&
+                    plus_name->normalized ==
+                        "https://example.com/group/a%2Bb.git",
+                "A plus in a URL path must not decode as a form-space");
+        const auto ipv6 = gitcube::parse_repository_url(
+            "https://[0:0:0:0:0:0:0:1]:443/group/repo", error);
+        require(ipv6 &&
+                    ipv6->normalized == "https://[::1]/group/repo.git",
+                "IPv6 host and default port normalization failed");
+        require(!gitcube::parse_repository_url(
+                    "https://example.com/group/bad%ZZ", error),
+                "Malformed percent escape must be rejected");
+        require(!gitcube::parse_repository_url(
+                    "https://example.com:99999/group/repo", error),
+                "Out-of-range port must be rejected");
+        require(!gitcube::parse_repository_url(
+                    "https://example.com//group/repo", error),
+                "Empty repository path segment must be rejected");
+        require(!gitcube::parse_repository_url(
+                    "https://example.com/group%2Frepo/name", error),
+                "Encoded path separator must be rejected");
+        require(gitcube::parse_github_account_url(
+                    "https://GitHub.com/OpenEggbert/") == "openeggbert",
+                "GitHub account identity should be case-normalized");
 
         const auto invalid = gitcube::parse_repository_url("git@github.com:openeggbert/cna.git", error);
         require(!invalid.has_value(), "SSH URL must be rejected");
@@ -155,23 +202,45 @@ int main() {
                                              "old fsck failure");
         }
         execute_sql(migration_path, R"SQL(
-DELETE FROM schema_migrations WHERE version=5;
+DELETE FROM schema_migrations WHERE version>=5;
+DROP INDEX idx_repositories_canonical_url;
+ALTER TABLE repositories DROP COLUMN canonical_url;
 ALTER TABLE repositories DROP COLUMN metadata_error;
 ALTER TABLE repositories DROP COLUMN metadata_status;
 ALTER TABLE repositories DROP COLUMN health_error;
 ALTER TABLE repositories DROP COLUMN health_status;
 ALTER TABLE repositories DROP COLUMN operation;
+UPDATE repositories
+SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
 )SQL");
         {
             gitcube::Database migrated(migration_path);
             migrated.initialize();
             const auto migrated_repo = migrated.get_repository(1);
+            const auto canonical_lookup =
+                migrated.get_repository_by_url(github->normalized);
             require(migrated_repo && migrated_repo->status == "ready" &&
                         migrated_repo->operation.empty() &&
                         migrated_repo->health_status == "unhealthy" &&
                         migrated_repo->health_error == "old fsck failure" &&
-                        migrated_repo->metadata_status == "unknown",
-                    "Schema v4 repository state did not migrate cleanly to v5");
+                        migrated_repo->metadata_status == "unknown" &&
+                        canonical_lookup && canonical_lookup->id == migrated_repo->id,
+                    "Schema v4 repository state did not migrate cleanly to v6");
+        }
+        {
+            gitcube::Database identity_db(temp / "identity.sqlite3");
+            identity_db.initialize();
+            const auto punctuation = identity_db.add_repository(*encoded_name);
+            const auto underscore = identity_db.add_repository(*underscore_name);
+            const auto punctuation_repo =
+                identity_db.get_repository(punctuation.id);
+            const auto underscore_repo =
+                identity_db.get_repository(underscore.id);
+            require(punctuation.created && underscore.created &&
+                        punctuation_repo && underscore_repo &&
+                        punctuation_repo->storage_relpath !=
+                            underscore_repo->storage_relpath,
+                    "Distinct URL identities must receive collision-free storage paths");
         }
 
         const auto printed = gitcube::ProcessRunner::run({"/usr/bin/printf", "hello"});
@@ -236,8 +305,13 @@ ALTER TABLE repositories DROP COLUMN operation;
         db.initialize();
         const auto added = db.add_repository(*github);
         require(added.created, "Repository should be inserted");
+        const auto duplicate = db.add_repository(*github_variant);
+        require(!duplicate.created && duplicate.id == added.id,
+                "Canonical URL variant should resolve to the existing repository");
         auto repository_state = db.get_repository(added.id);
         require(repository_state.has_value() && repository_state->status == "queued" &&
+                    repository_state->storage_relpath ==
+                        "repositories/by-id/" + std::to_string(added.id) + ".git" &&
                     repository_state->operation.empty() &&
                     repository_state->health_status == "unknown" &&
                     repository_state->metadata_status == "unknown",
@@ -331,7 +405,7 @@ ALTER TABLE repositories DROP COLUMN operation;
             {"git", "-C", source_repo.string(), "-c", "user.name=GitCube Test",
              "-c", "user.email=gitcube@example.invalid", "commit", "-m", "initial"});
         require(git_result.exit_code == 0, "Test Git commit failed");
-        const auto mirror = temp / github->relative_storage_path;
+        const auto mirror = temp / repository_state->storage_relpath;
         std::filesystem::create_directories(mirror.parent_path());
         git_result = gitcube::ProcessRunner::run(
             {"git", "clone", "--mirror", source_repo.string(), mirror.string()});
