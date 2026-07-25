@@ -319,6 +319,38 @@ bool GitService::repository_available(const Repository& repo) const {
     return result.exit_code == 0 && trim(result.output) == "true";
 }
 
+bool GitService::delete_repository_directory(const Repository& repo, std::string& error) {
+    const std::string expected_relpath =
+        "repositories/by-id/" + std::to_string(repo.id) + ".git";
+    if (repo.storage_relpath != expected_relpath) {
+        error = "Repository storage path is not a managed mirror path";
+        return false;
+    }
+
+    const auto lock = repository_lock(repo.id);
+    std::unique_lock guard(*lock);
+    const auto path = repo_path(repo);
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    if (ec) {
+        error = "Cannot inspect mirror directory: " + ec.message();
+        return false;
+    }
+    if (!exists) return true;
+    if (!std::filesystem::is_directory(path, ec)) {
+        error = ec ? "Cannot inspect mirror directory: " + ec.message()
+                   : "Mirror path is not a directory";
+        return false;
+    }
+
+    std::filesystem::remove_all(path, ec);
+    if (ec) {
+        error = "Cannot remove mirror directory: " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 JobExecutionResult GitService::execute(const Job& job) {
     if (job.type == "account") return import_account(job);
     if (!job.repo_id) return {false, {}, "Job has no repository"};

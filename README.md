@@ -212,6 +212,10 @@ description) if applicable, its releases, and:
 - **Refresh GitHub** (GitHub repositories only) — re-fetches metadata and releases.
 - **Clone again** — only shown if the local mirror is missing (e.g. it was deleted on
   disk, or a previous clone failed).
+- **Delete repository** — after a browser confirmation, permanently removes the
+  repository and its related GitCube database data, then removes its local bare mirror.
+  If filesystem removal fails, GitCube reports the leftover mirror path after the
+  database record has been deleted.
 - The **Importance** selector described above.
 - The **Export** controls described below.
 

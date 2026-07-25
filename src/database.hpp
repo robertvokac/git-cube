@@ -151,6 +151,9 @@ public:
                                           std::size_t per_page) const;
     std::optional<Repository> get_repository(std::int64_t id) const;
     std::optional<Repository> get_repository_by_url(const std::string& normalized_url) const;
+    // Removes the repository row and all data that references it through foreign-key
+    // cascades (jobs, refs and releases). The on-disk mirror is removed separately.
+    bool delete_repository(std::int64_t id);
 
     bool set_repository_paused(std::int64_t id, bool paused);
     bool set_repository_importance(std::int64_t id, int importance);

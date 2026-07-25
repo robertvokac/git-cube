@@ -807,6 +807,22 @@ std::optional<Repository> Database::get_repository_by_url(const std::string& nor
     return read_repository(stmt);
 }
 
+bool Database::delete_repository(std::int64_t id) {
+    ConnectionLease db(pool_, path_);
+    db.exec("BEGIN IMMEDIATE;");
+    try {
+        Statement remove(db.get(), "DELETE FROM repositories WHERE id=?");
+        remove.bind(1, id);
+        remove.step_done();
+        const bool deleted = sqlite3_changes(db.get()) == 1;
+        db.exec("COMMIT;");
+        return deleted;
+    } catch (...) {
+        db.exec("ROLLBACK;");
+        throw;
+    }
+}
+
 bool Database::set_repository_paused(std::int64_t id, bool paused) {
     ConnectionLease db(pool_, path_);
     Statement stmt(db.get(), "UPDATE repositories SET paused=?, modified_at=? WHERE id=?");

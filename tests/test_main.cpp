@@ -727,6 +727,7 @@ FROM counter;
         std::atomic<bool> application_shutdown{false};
         gitcube::Config application_config;
         application_config.data_dir = temp / "status-application";
+        const auto application_data_dir = application_config.data_dir;
         gitcube::Application status_application(
             std::move(application_config), application_shutdown);
         auto& status_database =
@@ -820,6 +821,47 @@ FROM counter;
                                                        status_request)
                         .status == 400,
                 "Status API must reject a malformed repository ID list");
+
+        const auto repository_to_delete =
+            status_database.get_repository(first_status_repo.id);
+        require(repository_to_delete.has_value(),
+                "Repository deletion fixture is missing");
+        const auto mirror_to_delete = application_data_dir /
+            repository_to_delete->storage_relpath;
+        std::filesystem::create_directories(mirror_to_delete);
+        {
+            std::ofstream marker(mirror_to_delete / "marker");
+            marker << "delete me";
+        }
+        gitcube::HttpRequest delete_page_request;
+        delete_page_request.method = "GET";
+        delete_page_request.path = "/repo/" +
+            std::to_string(repository_to_delete->id);
+        const auto delete_page = gitcube::ApplicationTestAccess::handle(
+            status_application, delete_page_request);
+        constexpr std::string_view csrf_marker = "name=\"csrf\" value=\"";
+        const auto delete_csrf_start = delete_page.body.find(csrf_marker);
+        require(delete_page.status == 200 &&
+                    delete_page.body.find("Delete repository") != std::string::npos &&
+                    delete_csrf_start != std::string::npos,
+                "Repository page did not expose the deletion control");
+        const auto delete_csrf_value_start =
+            delete_csrf_start + csrf_marker.size();
+        const auto delete_csrf_end = delete_page.body.find('"', delete_csrf_value_start);
+        require(delete_csrf_end != std::string::npos,
+                "Repository deletion form contained a malformed CSRF token");
+        gitcube::HttpRequest delete_request;
+        delete_request.method = "POST";
+        delete_request.path = "/repo/" +
+            std::to_string(repository_to_delete->id) + "/delete";
+        delete_request.body = "csrf=" + delete_page.body.substr(
+            delete_csrf_value_start, delete_csrf_end - delete_csrf_value_start);
+        const auto delete_response = gitcube::ApplicationTestAccess::handle(
+            status_application, delete_request);
+        require(delete_response.status == 303 &&
+                    !status_database.get_repository(repository_to_delete->id) &&
+                    !std::filesystem::exists(mirror_to_delete),
+                "Repository deletion must remove both database data and local mirror");
 
         db.update_repository_health(added.id, "healthy", "");
         repository_state = db.get_repository(added.id);

@@ -346,7 +346,7 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "GET" ? repository_page(*id) : HttpResponse::text("Method not allowed", 405);
     }
-    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance)$)"))) {
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance|delete)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "POST" ? repository_action(*id, match[2].str(), request)
@@ -645,6 +645,10 @@ HttpResponse Application::repository_page(std::int64_t id) {
          << action_form("/repo/" + std::to_string(id) + "/health", "Health", "secondary");
     if (repo->github) body << action_form("/repo/" + std::to_string(id) + "/metadata", "Refresh GitHub", "secondary");
     if (!git_.repository_available(*repo)) body << action_form("/repo/" + std::to_string(id) + "/clone", "Clone again", "danger");
+    body << "<form method=\"post\" action=\"/repo/" << id
+         << "/delete\" onsubmit=\"return confirm('Delete this repository, its GitCube data, and its local mirror?');\">"
+         << "<input type=\"hidden\" name=\"csrf\" value=\"" << html_escape(csrf_token_)
+         << "\"><button class=\"danger\" type=\"submit\">Delete repository</button></form>";
     body << "</div></div>";
     if (!repo->description.empty()) body << "<p class=\"description\">" << html_escape(repo->description) << "</p>";
     if (!repo->last_error.empty()) body << "<p class=\"error\">" << html_escape(repo->last_error) << "</p>";
@@ -1038,6 +1042,17 @@ HttpResponse Application::repository_action(std::int64_t id, const std::string& 
         }
         database_.set_repository_importance(id, importance);
         notice = "Importance set to " + std::string(importance_label(importance));
+    } else if (action == "delete") {
+        if (!database_.delete_repository(id)) {
+            return HttpResponse::redirect("/?error=" + url_encode("Repository no longer exists"));
+        }
+        std::string removal_error;
+        if (!git_.delete_repository_directory(*repo, removal_error)) {
+            return HttpResponse::redirect("/?error=" + url_encode(
+                "Repository data was deleted, but its local mirror could not be removed at " +
+                repo->storage_relpath + ": " + removal_error));
+        }
+        return HttpResponse::redirect("/?notice=" + url_encode("Repository and local mirror deleted"));
     } else {
         const std::string type = action == "clone" ? "clone" : action;
         const bool queued = database_.enqueue_job(id, type, "Requested from repository page");

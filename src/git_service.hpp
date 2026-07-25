@@ -102,6 +102,9 @@ public:
 
     static bool is_github_rate_limited(const GitHubApiResult& result);
     bool repository_available(const Repository& repo) const;
+    // Removes exactly this repository's managed bare-mirror directory. Call this only
+    // after its database row has been removed, so no new work can be queued for it.
+    bool delete_repository_directory(const Repository& repo, std::string& error);
     std::vector<TreeEntry> list_tree(const Repository& repo, const std::string& ref,
                                      const std::string& path, std::string& error) const;
     std::vector<CommitInfo> list_commits(const Repository& repo, const std::string& ref,
