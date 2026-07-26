@@ -532,7 +532,7 @@ HttpResponse Application::add_repositories_page() {
             "account or organization URL (for example https://github.com/openeggbert) queues every public "
             "repository under that account. Lines for repositories already known to GitCube are left alone.</p>"
          << "<form method=\"post\" action=\"/import\"><input type=\"hidden\" name=\"csrf\" value=\"" << html_escape(csrf_token_)
-         << "\"><textarea name=\"urls\" rows=\"10\" placeholder=\"https://github.com/openeggbert/cna\nhttps://github.com/openeggbert\"></textarea>"
+         << "\"><textarea name=\"urls\" rows=\"20\" placeholder=\"https://github.com/openeggbert/cna\nhttps://github.com/openeggbert\"></textarea>"
          << "<p><button type=\"submit\">Add to clone queue</button></p></form></section>";
 
     body << R"HTML(<script>
