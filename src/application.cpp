@@ -346,6 +346,12 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "GET" ? repository_page(*id) : HttpResponse::text("Method not allowed", 405);
     }
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/disk-usage$)"))) {
+        const auto id = parse_id(match);
+        if (!id) return HttpResponse::text("Invalid repository id", 400);
+        return request.method == "GET" ? repository_disk_usage_api(*id)
+                                       : HttpResponse::text("Method not allowed", 405);
+    }
     if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance|delete)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
@@ -683,7 +689,8 @@ HttpResponse Application::repository_page(std::int64_t id) {
          << action_form("/repo/" + std::to_string(id) + "/archive-git",
                         "Download whole repository (.git, .zip)", "secondary")
          << "</div></td></tr>";
-    body << "<tr><th>Storage</th><td class=\"path\">" << html_escape(repo->storage_relpath) << "</td></tr><tr><th>Default branch</th><td>"
+    body << "<tr><th>Storage</th><td class=\"path\">" << html_escape(repo->storage_relpath)
+         << "</td></tr><tr><th>Disk usage</th><td id=\"disk-usage\" class=\"muted\">Checking…</td></tr><tr><th>Default branch</th><td>"
          << html_escape(repo->default_branch.empty() ? "unknown" : repo->default_branch) << "</td></tr><tr><th>HEAD</th><td class=\"path\">"
          << html_escape(repo->head_oid) << "</td></tr><tr><th>Objects</th><td>" << repo->object_count << "</td></tr><tr><th>Last fetch</th><td>"
          << html_escape(repo->last_fetch_at.empty() ? "—" : repo->last_fetch_at) << "</td></tr><tr><th>Last health check</th><td>"
@@ -755,6 +762,20 @@ HttpResponse Application::repository_page(std::int64_t id) {
         }
         body << "</tbody></table></section>";
     }
+    body << R"HTML(<script>
+(() => {
+  const target = document.getElementById('disk-usage');
+  fetch('/repo/)HTML" << id << R"HTML(/disk-usage').then(async (response) => {
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Could not determine disk usage');
+    target.textContent = data.human + ' (' + data.bytes.toLocaleString() + ' B)';
+    target.className = '';
+  }).catch((error) => {
+    target.textContent = error.message;
+    target.className = 'error';
+  });
+})();
+</script>)HTML";
     return {200, "text/html; charset=utf-8", page(repo->owner + "/" + repo->name, body.str()), {}};
 }
 
@@ -946,6 +967,22 @@ HttpResponse Application::api_status(const HttpRequest& request) {
              << "\",\"paused\":" << (repo.paused ? "true" : "false") << "}";
     }
     json << "]}";
+    return HttpResponse::json(json.str());
+}
+
+HttpResponse Application::repository_disk_usage_api(std::int64_t id) {
+    const auto repo = database_.get_repository(id);
+    if (!repo) {
+        return HttpResponse::json("{\"ok\":false,\"error\":\"Repository not found\"}", 404);
+    }
+    const auto usage = git_.repository_disk_usage(*repo);
+    if (!usage.found) {
+        return HttpResponse::json(
+            "{\"ok\":false,\"error\":\"" + json_escape(usage.error) + "\"}");
+    }
+    std::ostringstream json;
+    json << "{\"ok\":true,\"bytes\":" << usage.bytes << ",\"human\":\""
+         << json_escape(format_bytes(usage.bytes)) << "\"}";
     return HttpResponse::json(json.str());
 }
 

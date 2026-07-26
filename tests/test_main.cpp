@@ -828,7 +828,23 @@ FROM counter;
                 "Repository deletion fixture is missing");
         const auto mirror_to_delete = application_data_dir /
             repository_to_delete->storage_relpath;
-        std::filesystem::create_directories(mirror_to_delete);
+        std::filesystem::create_directories(mirror_to_delete.parent_path());
+        const auto bare_init = gitcube::ProcessRunner::run(
+            {"git", "init", "--bare", mirror_to_delete.string()});
+        require(bare_init.exit_code == 0,
+                "Repository disk-usage API fixture init failed");
+        gitcube::HttpRequest disk_usage_request;
+        disk_usage_request.method = "GET";
+        disk_usage_request.path = "/repo/" +
+            std::to_string(repository_to_delete->id) + "/disk-usage";
+        const auto disk_usage_response = gitcube::ApplicationTestAccess::handle(
+            status_application, disk_usage_request);
+        require(disk_usage_response.status == 200 &&
+                    disk_usage_response.body.find("\"ok\":true") !=
+                        std::string::npos &&
+                    disk_usage_response.body.find("\"bytes\":") !=
+                        std::string::npos,
+                "Repository disk-usage API did not return a measured size");
         {
             std::ofstream marker(mirror_to_delete / "marker");
             marker << "delete me";
@@ -843,6 +859,8 @@ FROM counter;
         const auto delete_csrf_start = delete_page.body.find(csrf_marker);
         require(delete_page.status == 200 &&
                     delete_page.body.find("Delete repository") != std::string::npos &&
+                    delete_page.body.find("Disk usage") != std::string::npos &&
+                    delete_page.body.find("/disk-usage") != std::string::npos &&
                     delete_csrf_start != std::string::npos,
                 "Repository page did not expose the deletion control");
         const auto delete_csrf_value_start =
@@ -860,7 +878,10 @@ FROM counter;
             status_application, delete_request);
         require(delete_response.status == 303 &&
                     !status_database.get_repository(repository_to_delete->id) &&
-                    !std::filesystem::exists(mirror_to_delete),
+                    !std::filesystem::exists(mirror_to_delete) &&
+                    !std::filesystem::exists(application_data_dir / "cache" /
+                                              "repository-sizes" /
+                                              (std::to_string(repository_to_delete->id) + ".cache")),
                 "Repository deletion must remove both database data and local mirror");
 
         db.update_repository_health(added.id, "healthy", "");
@@ -960,6 +981,52 @@ FROM counter;
         gitcube::GitService git_service(temp, db, shutdown_requested);
         const auto stored_repo = db.get_repository(added.id);
         require(stored_repo.has_value(), "Stored test repository is missing");
+        const auto initial_disk_usage = git_service.repository_disk_usage(*stored_repo);
+        require(initial_disk_usage.found && initial_disk_usage.bytes > 0,
+                "Repository disk usage was not calculated");
+        const auto disk_usage_cache =
+            temp / "cache" / "repository-sizes" /
+            (std::to_string(added.id) + ".cache");
+        require(std::filesystem::is_regular_file(disk_usage_cache),
+                "Repository disk usage cache was not created");
+        std::ifstream initial_cache_input(disk_usage_cache);
+        const std::string initial_cache_contents(
+            (std::istreambuf_iterator<char>(initial_cache_input)),
+            std::istreambuf_iterator<char>());
+        std::filesystem::last_write_time(
+            disk_usage_cache, std::filesystem::file_time_type::clock::now() -
+                                  std::chrono::hours(2));
+        const auto unchanged_disk_usage = git_service.repository_disk_usage(*stored_repo);
+        require(unchanged_disk_usage.found &&
+                    unchanged_disk_usage.bytes == initial_disk_usage.bytes &&
+                    std::filesystem::last_write_time(disk_usage_cache) >
+                        std::filesystem::file_time_type::clock::now() - std::chrono::minutes(1),
+                "Unchanged repository disk usage cache was not refreshed");
+
+        {
+            std::ofstream changed(source_repo / "CHANGE.md", std::ios::binary);
+            changed << std::string(128 * 1024, 'x');
+        }
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "-C", source_repo.string(), "add", "CHANGE.md"});
+        require(git_result.exit_code == 0, "Test changed repository add failed");
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "-C", source_repo.string(), "-c", "user.name=GitCube Test",
+             "-c", "user.email=gitcube@example.invalid", "commit", "-m", "change"});
+        require(git_result.exit_code == 0, "Test changed repository commit failed");
+        git_result = gitcube::ProcessRunner::run(
+            {"git", "--git-dir", mirror.string(), "fetch", "--all", "--prune"});
+        require(git_result.exit_code == 0, "Test mirror fetch failed");
+        std::filesystem::last_write_time(
+            disk_usage_cache, std::filesystem::file_time_type::clock::now() -
+                                  std::chrono::hours(2));
+        const auto changed_disk_usage = git_service.repository_disk_usage(*stored_repo);
+        std::ifstream changed_cache_input(disk_usage_cache);
+        const std::string changed_cache_contents(
+            (std::istreambuf_iterator<char>(changed_cache_input)),
+            std::istreambuf_iterator<char>());
+        require(changed_disk_usage.found && changed_cache_contents != initial_cache_contents,
+                "Changed repository disk usage was not recalculated");
         std::string git_error;
         const auto ref_archive =
             git_service.archive_ref(*stored_repo, "HEAD", 1024 * 1024, git_error);
@@ -989,6 +1056,10 @@ FROM counter;
         require(git_error.empty() && bare_archive.found &&
                     std::filesystem::file_size(bare_archive.file) == bare_archive.size,
                 "Streamed bare-repository archive failed");
+        std::string deletion_error;
+        require(git_service.delete_repository_directory(*stored_repo, deletion_error) &&
+                    !std::filesystem::exists(disk_usage_cache),
+                "Repository deletion did not remove its disk-usage cache");
         std::filesystem::remove_all(temp);
 
         std::cout << "All GitCube tests passed.\n";

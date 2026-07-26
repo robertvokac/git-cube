@@ -64,6 +64,7 @@ private:
     HttpResponse commit_page(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_ref_download(std::int64_t id, const HttpRequest& request);
     HttpResponse archive_git_download(std::int64_t id, const HttpRequest& request);
+    HttpResponse repository_disk_usage_api(std::int64_t id);
     HttpResponse api_status(const HttpRequest& request);
     HttpResponse check_repo_api(const HttpRequest& request);
 

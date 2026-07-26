@@ -8,10 +8,12 @@
 #include <charconv>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace gitcube {
@@ -67,6 +69,170 @@ constexpr std::size_t kGitHubMaxResponseBytes = 8 * 1024 * 1024;
 // Accounted record content is capped at 16 MiB, leaving another 16 MiB for vector
 // spare capacity/allocator overhead under the documented 32 MiB accumulation budget.
 constexpr std::size_t kGitHubMaxCollectedReleaseBytes = 16 * 1024 * 1024;
+constexpr auto kRepositorySizeCacheLifetime = std::chrono::hours(1);
+
+struct DiskUsageCacheEntry {
+    std::uintmax_t bytes = 0;
+    std::string state;
+};
+
+std::optional<DiskUsageCacheEntry> read_disk_usage_cache(
+    const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) return std::nullopt;
+
+    std::string version;
+    std::string bytes_text;
+    std::string state;
+    std::string line;
+    while (std::getline(input, line)) {
+        const auto separator = line.find('=');
+        if (separator == std::string::npos) return std::nullopt;
+        const std::string_view key(line.data(), separator);
+        const std::string_view value(line.data() + separator + 1,
+                                     line.size() - separator - 1);
+        if (key == "version") version = value;
+        else if (key == "bytes") bytes_text = value;
+        else if (key == "state") state = value;
+        else return std::nullopt;
+    }
+    if (version != "1" || bytes_text.empty() || state.empty()) return std::nullopt;
+
+    DiskUsageCacheEntry entry;
+    const auto [end, error] = std::from_chars(
+        bytes_text.data(), bytes_text.data() + bytes_text.size(), entry.bytes);
+    if (error != std::errc{} || end != bytes_text.data() + bytes_text.size()) {
+        return std::nullopt;
+    }
+    entry.state = std::move(state);
+    return entry;
+}
+
+bool cache_is_fresh(const std::filesystem::path& path) {
+    std::error_code error;
+    const auto modified = std::filesystem::last_write_time(path, error);
+    if (error) return false;
+    const auto age = std::filesystem::file_time_type::clock::now() - modified;
+    return age >= std::filesystem::file_time_type::duration::zero() &&
+           age < kRepositorySizeCacheLifetime;
+}
+
+bool touch_cache(const std::filesystem::path& path) {
+    std::error_code error;
+    std::filesystem::last_write_time(
+        path, std::filesystem::file_time_type::clock::now(), error);
+    return !error;
+}
+
+bool write_disk_usage_cache(const std::filesystem::path& path,
+                            const DiskUsageCacheEntry& entry,
+                            std::string& error) {
+    std::error_code filesystem_error;
+    std::filesystem::create_directories(path.parent_path(), filesystem_error);
+    if (filesystem_error) {
+        error = "Cannot create disk-usage cache directory: " + filesystem_error.message();
+        return false;
+    }
+    std::filesystem::permissions(path.parent_path(), std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace,
+                                 filesystem_error);
+    if (filesystem_error) {
+        error = "Cannot secure disk-usage cache directory: " + filesystem_error.message();
+        return false;
+    }
+
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream output(temporary, std::ios::trunc);
+        if (!output) {
+            error = "Cannot create disk-usage cache file";
+            return false;
+        }
+        output << "version=1\nbytes=" << entry.bytes << "\nstate=" << entry.state << '\n';
+        output.close();
+        if (!output) {
+            std::filesystem::remove(temporary, filesystem_error);
+            error = "Cannot write disk-usage cache file";
+            return false;
+        }
+    }
+    std::filesystem::permissions(
+        temporary, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, filesystem_error);
+    if (filesystem_error) {
+        std::filesystem::remove(temporary, filesystem_error);
+        error = "Cannot secure disk-usage cache file";
+        return false;
+    }
+    std::filesystem::rename(temporary, path, filesystem_error);
+    if (filesystem_error) {
+        std::filesystem::remove(temporary, filesystem_error);
+        error = "Cannot replace disk-usage cache file: " + filesystem_error.message();
+        return false;
+    }
+    return true;
+}
+
+std::optional<std::uintmax_t> allocated_directory_size(
+    const std::filesystem::path& path, std::string& error) {
+    std::uintmax_t total = 0;
+    std::unordered_set<std::uint64_t> hard_linked_files;
+    const auto add_path = [&](const std::filesystem::path& candidate) -> bool {
+        struct stat metadata {};
+        if (lstat(candidate.c_str(), &metadata) != 0) {
+            error = "Cannot inspect mirror path: " + candidate.string();
+            return false;
+        }
+        if (!S_ISDIR(metadata.st_mode) && metadata.st_nlink > 1) {
+            const auto identity = (static_cast<std::uint64_t>(metadata.st_dev) << 32U) ^
+                                  static_cast<std::uint64_t>(metadata.st_ino);
+            if (!hard_linked_files.insert(identity).second) return true;
+        }
+        if (metadata.st_blocks < 0 ||
+            static_cast<std::uintmax_t>(metadata.st_blocks) >
+                (std::numeric_limits<std::uintmax_t>::max() - total) / 512U) {
+            error = "Mirror disk usage is too large to represent";
+            return false;
+        }
+        total += static_cast<std::uintmax_t>(metadata.st_blocks) * 512U;
+        return true;
+    };
+
+    if (!add_path(path)) return std::nullopt;
+    std::error_code filesystem_error;
+    std::filesystem::recursive_directory_iterator iterator(path, filesystem_error);
+    if (filesystem_error) {
+        error = "Cannot enumerate mirror directory: " + filesystem_error.message();
+        return std::nullopt;
+    }
+    const std::filesystem::recursive_directory_iterator end;
+    while (iterator != end) {
+        if (!add_path(iterator->path())) return std::nullopt;
+        iterator.increment(filesystem_error);
+        if (filesystem_error) {
+            error = "Cannot enumerate mirror directory: " + filesystem_error.message();
+            return std::nullopt;
+        }
+    }
+    return total;
+}
+
+std::string state_fingerprint(std::string_view refs, std::string_view objects) {
+    std::uint64_t hash = 14695981039346656037ULL;
+    const auto append = [&hash](std::string_view value) {
+        for (const unsigned char character : value) {
+            hash ^= character;
+            hash *= 1099511628211ULL;
+        }
+    };
+    append(refs);
+    append("\xff");
+    append(objects);
+    std::ostringstream output;
+    output << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return output.str();
+}
 
 std::optional<std::int64_t> parse_int64(std::string_view value) {
     const std::string cleaned = trim(value);
@@ -281,6 +447,12 @@ std::filesystem::path GitService::repo_path(const Repository& repo) const {
     return data_dir_ / repo.storage_relpath;
 }
 
+std::filesystem::path GitService::repository_size_cache_path(
+    std::int64_t repo_id) const {
+    return data_dir_ / "cache" / "repository-sizes" /
+        (std::to_string(repo_id) + ".cache");
+}
+
 std::filesystem::path GitService::temporary_output_path(
     const Repository& repo, std::string_view suffix) const {
     std::filesystem::create_directories(data_dir_ / "tmp");
@@ -296,6 +468,14 @@ std::shared_ptr<std::shared_mutex> GitService::repository_lock(
     std::lock_guard lock(repository_locks_mutex_);
     auto& mutex = repository_locks_[repo_id];
     if (!mutex) mutex = std::make_shared<std::shared_mutex>();
+    return mutex;
+}
+
+std::shared_ptr<std::mutex> GitService::repository_size_cache_lock(
+    std::int64_t repo_id) const {
+    std::lock_guard lock(repository_size_cache_locks_mutex_);
+    auto& mutex = repository_size_cache_locks_[repo_id];
+    if (!mutex) mutex = std::make_shared<std::mutex>();
     return mutex;
 }
 
@@ -319,6 +499,58 @@ bool GitService::repository_available(const Repository& repo) const {
     return result.exit_code == 0 && trim(result.output) == "true";
 }
 
+std::optional<std::string> GitService::repository_state_token(
+    const Repository& repo, std::string& error) const {
+    const auto refs = ProcessRunner::run(
+        git_args(repo, {"for-each-ref", "--format=%(refname)%00%(objectname)%00"}), {},
+        &shutdown_requested_, std::chrono::seconds(30));
+    if (refs.exit_code != 0) {
+        error = "Cannot determine mirror refs: " + process_error(refs);
+        return std::nullopt;
+    }
+    const auto objects = ProcessRunner::run(
+        git_args(repo, {"count-objects", "-v"}), {}, &shutdown_requested_,
+        std::chrono::seconds(30));
+    if (objects.exit_code != 0) {
+        error = "Cannot determine mirror object state: " + process_error(objects);
+        return std::nullopt;
+    }
+    return state_fingerprint(refs.output, objects.output);
+}
+
+RepositoryDiskUsage GitService::repository_disk_usage(const Repository& repo) const {
+    const auto cache_lock = repository_size_cache_lock(repo.id);
+    std::lock_guard cache_guard(*cache_lock);
+    const auto cache_path = repository_size_cache_path(repo.id);
+    const auto cache = read_disk_usage_cache(cache_path);
+    if (cache && cache_is_fresh(cache_path)) {
+        return {true, cache->bytes, {}};
+    }
+
+    const auto lock = repository_lock(repo.id);
+    std::shared_lock repository_guard(*lock);
+    if (!repository_available(repo)) {
+        return {false, 0, "Repository is not available locally"};
+    }
+
+    std::string error;
+    const auto state = repository_state_token(repo, error);
+    if (!state) return {false, 0, std::move(error)};
+    if (cache && cache->state == *state) {
+        if (!touch_cache(cache_path)) {
+            return {false, 0, "Cannot refresh disk-usage cache timestamp"};
+        }
+        return {true, cache->bytes, {}};
+    }
+
+    const auto bytes = allocated_directory_size(repo_path(repo), error);
+    if (!bytes) return {false, 0, std::move(error)};
+    if (!write_disk_usage_cache(cache_path, {*bytes, *state}, error)) {
+        return {false, 0, std::move(error)};
+    }
+    return {true, *bytes, {}};
+}
+
 bool GitService::delete_repository_directory(const Repository& repo, std::string& error) {
     const std::string expected_relpath =
         "repositories/by-id/" + std::to_string(repo.id) + ".git";
@@ -327,8 +559,16 @@ bool GitService::delete_repository_directory(const Repository& repo, std::string
         return false;
     }
 
+    const auto size_cache_lock = repository_size_cache_lock(repo.id);
+    std::lock_guard size_cache_guard(*size_cache_lock);
     const auto lock = repository_lock(repo.id);
     std::unique_lock guard(*lock);
+    std::error_code cache_error;
+    std::filesystem::remove(repository_size_cache_path(repo.id), cache_error);
+    if (cache_error) {
+        error = "Cannot remove disk-usage cache: " + cache_error.message();
+        return false;
+    }
     const auto path = repo_path(repo);
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec);

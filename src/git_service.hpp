@@ -93,6 +93,12 @@ struct ArchiveResult {
     std::uintmax_t size = 0;
 };
 
+struct RepositoryDiskUsage {
+    bool found = false;
+    std::uintmax_t bytes = 0;
+    std::string error;
+};
+
 class GitService {
 public:
     GitService(std::filesystem::path data_dir, Database& database,
@@ -102,6 +108,10 @@ public:
 
     static bool is_github_rate_limited(const GitHubApiResult& result);
     bool repository_available(const Repository& repo) const;
+    // Returns allocated filesystem space used by the bare mirror. Results are cached
+    // outside the repository for one hour; expired entries are remeasured only if the
+    // mirror's refs/object state changed.
+    RepositoryDiskUsage repository_disk_usage(const Repository& repo) const;
     // Removes exactly this repository's managed bare-mirror directory. Call this only
     // after its database row has been removed, so no new work can be queued for it.
     bool delete_repository_directory(const Repository& repo, std::string& error);
@@ -131,17 +141,24 @@ private:
     Database& database_;
     const std::atomic<bool>& shutdown_requested_;
     mutable std::mutex repository_locks_mutex_;
+    mutable std::mutex repository_size_cache_locks_mutex_;
     // Public GitHub responses can be several MiB per page. Serializing API requests
     // keeps the worker count from multiplying that memory footprint.
     mutable std::mutex github_api_request_mutex_;
     mutable std::unordered_map<std::int64_t, std::shared_ptr<std::shared_mutex>>
         repository_locks_;
+    mutable std::unordered_map<std::int64_t, std::shared_ptr<std::mutex>>
+        repository_size_cache_locks_;
     mutable std::atomic<std::uint64_t> temporary_file_counter_{0};
 
     std::filesystem::path repo_path(const Repository& repo) const;
+    std::filesystem::path repository_size_cache_path(std::int64_t repo_id) const;
     std::filesystem::path temporary_output_path(const Repository& repo,
                                                 std::string_view suffix) const;
     std::shared_ptr<std::shared_mutex> repository_lock(std::int64_t repo_id) const;
+    std::shared_ptr<std::mutex> repository_size_cache_lock(std::int64_t repo_id) const;
+    std::optional<std::string> repository_state_token(const Repository& repo,
+                                                       std::string& error) const;
     std::vector<std::string> git_args(const Repository& repo,
                                       std::initializer_list<std::string> args) const;
     JobExecutionResult clone_repository(const Job& job, const Repository& repo);

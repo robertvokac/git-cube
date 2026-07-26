@@ -41,6 +41,8 @@ on disk.
   URL to queue every public repository under that account.
 - An AJAX "does GitCube already have this?" check on the Add repositories page — no page
   reload.
+- Per-mirror disk usage on the repository detail page, with an on-disk one-hour cache
+  that is remeasured only when the mirror's Git state changes.
 - Search, filter (status, GitHub account, git tag, importance) and paginated browsing of
   the repository list.
 - A 0–3 "importance" rating per repository (★/★★/★★★), filterable and editable from the
@@ -217,6 +219,10 @@ description) if applicable, its releases, and:
   If filesystem removal fails, GitCube reports the leftover mirror path after the
   database record has been deleted.
 - The **Importance** selector described above.
+- **Disk usage** — allocated filesystem space used by the bare mirror (like `du`),
+  loaded asynchronously. Its cache lives under `cache/repository-sizes/`; after one
+  hour GitCube checks refs and object statistics, touching the cache timestamp without
+  a directory scan when the mirror is unchanged.
 - The **Export** controls described below.
 
 To keep a single response bounded even for repositories with extreme history, the
