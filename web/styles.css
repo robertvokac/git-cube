@@ -122,6 +122,8 @@ h1, h2, h3 { line-height: 1.13; letter-spacing: -0.04em; }
 .quick-start-layout { display: grid; grid-template-columns: minmax(0, .84fr) minmax(0, 1.16fr); gap: clamp(45px, 7vw, 95px); align-items: center; }
 .quick-start-copy { max-width: 425px; }
 .quick-start-copy code { padding: 1px 5px; border-radius: 4px; background: #edf1f8; color: #30486c; font-size: .91em; }
+.text-link { display: inline-flex; align-items: center; gap: 8px; margin-top: 10px; color: #365fd5; font-weight: 750; border-bottom: 1px solid #8da9fb; }
+.text-link:hover { color: #173fac; }
 .code-panel { min-width: 0; overflow: hidden; border: 1px solid #233a58; border-radius: 16px; background: #0f1c2f; color: #e4ebf8; box-shadow: 0 22px 55px rgba(14,32,62,.18); }
 .code-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid #29405b; color: #abc0d8; font-size: .82rem; font-weight: 700; }
 .code-header > span { display: inline-flex; align-items: center; gap: 9px; }
