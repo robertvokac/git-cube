@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0c1423">
+    <meta name="description" content="GitCube is a local C++20 server for mirroring, browsing, and exporting public Git repositories from one place.">
+    <title>GitCube — Your public Git repositories, close at hand</title>
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+    <link rel="stylesheet" href="./styles.css">
+    <script src="./script.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <div class="shell header-inner">
+        <a class="brand" href="#top" aria-label="GitCube home">
+          <img src="./favicon.svg" alt="" width="36" height="36">
+          <span>GitCube</span>
+        </a>
+        <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu">
+          <span></span><span></span><span></span>
+        </button>
+        <nav class="site-nav" id="site-nav" aria-label="Main navigation">
+          <a href="#features">Features</a>
+          <a href="#how-it-works">How it works</a>
+          <a href="#quick-start">Quick start</a>
+          <a class="nav-github" href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section class="hero" id="top" aria-labelledby="hero-title">
+        <div class="hero-grid" aria-hidden="true"></div>
+        <div class="shell hero-layout">
+          <div class="hero-copy">
+            <p class="eyebrow"><span class="eyebrow-mark"></span> A local home for public Git repositories</p>
+            <h1 id="hero-title">Your public Git repositories, <em>close at hand.</em></h1>
+            <p class="hero-lead">Mirror, browse, check, and export public repositories from one local dashboard. GitCube keeps the work moving in the background while your collection stays on your machine.</p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="#quick-start">Get started <span aria-hidden="true">→</span></a>
+              <a class="button button-secondary" href="https://github.com/robertvokac/git-cube/blob/develop/README.md" target="_blank" rel="noopener noreferrer">Read the docs <span aria-hidden="true">↗</span></a>
+            </div>
+            <p class="hero-footnote">C++20 · SQLite · Linux/POSIX · No Node.js</p>
+          </div>
+          <div class="showcase-wrap">
+            <div class="showcase-note"><span class="note-dot"></span> An illustrative view of your collection</div>
+            <div class="showcase" aria-label="Illustrative GitCube repository dashboard with sample data">
+              <div class="showcase-topbar">
+                <span class="showcase-brand"><img src="./favicon.svg" alt="" width="25" height="25"> GitCube</span>
+                <span class="showcase-toplink">Repositories</span>
+                <span class="showcase-toplink">Jobs</span>
+                <span class="showcase-avatar" aria-hidden="true">GC</span>
+              </div>
+              <div class="showcase-body">
+                <div class="showcase-heading">
+                  <div><span class="preview-overline">YOUR COLLECTION</span><h2>Repositories</h2></div>
+                  <span class="preview-add">+ Add repository</span>
+                </div>
+                <div class="preview-search">⌕ <span>Search repositories</span></div>
+                <div class="preview-list">
+                  <div class="preview-repo">
+                    <span class="repo-symbol" aria-hidden="true">⌘</span>
+                    <div class="repo-info"><strong>example / design-system</strong><small>Mirrored locally · main</small></div>
+                    <span class="status status-ready"><i></i> Ready</span>
+                  </div>
+                  <div class="preview-repo">
+                    <span class="repo-symbol" aria-hidden="true">⌘</span>
+                    <div class="repo-info"><strong>example / command-line</strong><small>Fetching updates</small></div>
+                    <span class="status status-active"><i></i> Fetching</span>
+                  </div>
+                  <div class="preview-repo">
+                    <span class="repo-symbol" aria-hidden="true">⌘</span>
+                    <div class="repo-info"><strong>example / handbook</strong><small>Mirrored locally · main</small></div>
+                    <span class="status status-ready"><i></i> Ready</span>
+                  </div>
+                </div>
+                <div class="preview-footer"><span><i></i> Local server running</span><span>1 active job</span></div>
+              </div>
+            </div>
+            <div class="floating-card" aria-hidden="true"><span class="floating-icon">✓</span><span><strong>Mirror ready</strong><small>Browse files without checkout</small></span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="value-strip" aria-label="GitCube at a glance">
+        <div class="shell value-items">
+          <p><span class="value-icon" aria-hidden="true">◈</span> Bare mirrors, no worktrees</p>
+          <p><span class="value-icon" aria-hidden="true">◎</span> Persistent background jobs</p>
+          <p><span class="value-icon" aria-hidden="true">⌁</span> Everything runs locally</p>
+        </div>
+      </section>
+
+      <section class="section features-section" id="features" aria-labelledby="features-title">
+        <div class="shell">
+          <div class="section-intro">
+            <p class="section-kicker">WHAT GITCUBE DOES</p>
+            <h2 id="features-title">A dependable place for your repository collection.</h2>
+            <p>Add public repositories once, then keep track of their mirrors, history, and health in one browser tab.</p>
+          </div>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <span class="feature-number">01 / MIRROR</span>
+              <div class="feature-icon" aria-hidden="true">↧</div>
+              <h3>Keep copies current</h3>
+              <p>Clone a public repository or import a GitHub account. A persistent SQLite job queue handles cloning, fetching, and retries with configurable workers.</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-number">02 / EXPLORE</span>
+              <div class="feature-icon" aria-hidden="true">⌘</div>
+              <h3>Browse without checkout</h3>
+              <p>Open branches, tags, files, commits, and diffs straight from the bare mirror. Read Markdown and find a repository with search and filters.</p>
+            </article>
+            <article class="feature-card">
+              <span class="feature-number">03 / PRESERVE</span>
+              <div class="feature-icon" aria-hidden="true">▣</div>
+              <h3>Check and export</h3>
+              <p>Run remote and local health checks, follow job history, and download either a branch or tag as files or the whole re-clonable mirror as a ZIP.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="workflow-section" id="how-it-works" aria-labelledby="workflow-title">
+        <div class="shell workflow-layout">
+          <div class="workflow-heading">
+            <p class="section-kicker">THE WORKFLOW</p>
+            <h2 id="workflow-title">From a URL to a local mirror.</h2>
+            <p>GitCube serves a browser interface on your computer and does the Git work in the background.</p>
+          </div>
+          <ol class="workflow-list">
+            <li><span class="step-number">01</span><div><h3>Add public URLs</h3><p>Paste one or more HTTP(S) repository URLs, or a GitHub account URL for a public bulk import.</p></div></li>
+            <li><span class="step-number">02</span><div><h3>Let the queue work</h3><p>Clones, fetches, health checks, and GitHub metadata updates run as persistent jobs.</p></div></li>
+            <li><span class="step-number">03</span><div><h3>Browse and export</h3><p>Inspect the mirror in your browser or download the files and history you need.</p></div></li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="section quick-start-section" id="quick-start" aria-labelledby="quick-start-title">
+        <div class="shell quick-start-layout">
+          <div class="quick-start-copy">
+            <p class="section-kicker">QUICK START</p>
+            <h2 id="quick-start-title">Running locally in a few commands.</h2>
+            <p>Install the build tools on Debian 13, then build and start GitCube from the project directory. Open the local dashboard at <code>127.0.0.1:9999</code>.</p>
+            <a class="text-link" href="https://github.com/robertvokac/git-cube/blob/develop/README.md#quick-start" target="_blank" rel="noopener noreferrer">Full setup guide <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="code-panel">
+            <div class="code-header"><span><span class="terminal-dot"></span> Terminal</span><button class="copy-button" type="button" aria-live="polite">Copy commands</button></div>
+            <pre id="quick-start-code"><code><span class="code-comment"># Dependencies (Debian 13)</span>
+sudo apt install build-essential cmake git curl zip libsqlite3-dev
+
+<span class="code-comment"># Build and run</span>
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+./build/gitcube</code></pre>
+          </div>
+        </div>
+      </section>
+
+      <section class="boundary-section" aria-labelledby="boundary-title">
+        <div class="shell boundary-inner">
+          <div><p class="section-kicker">BUILT FOR LOCAL USE</p><h2 id="boundary-title">Simple by design.</h2></div>
+          <p>GitCube is a single-user localhost application for public HTTP(S) repositories. This version targets Linux/POSIX and does not support private repositories or SSH URLs.</p>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <a class="brand footer-brand" href="#top"><img src="./favicon.svg" alt="" width="28" height="28"><span>GitCube</span></a>
+        <p>Local mirrors for public Git.</p>
+        <div class="footer-links"><a href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">Source code</a><a href="https://github.com/robertvokac/git-cube/blob/develop/LICENSE" target="_blank" rel="noopener noreferrer">MIT license</a></div>
+      </div>
+    </footer>
+  </body>
+</html>
