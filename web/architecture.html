@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c1423">
+  <meta name="description" content="Understand GitCube's C++20 server, SQLite-backed jobs, bare mirror storage, recovery behavior, security boundary, and current limitations.">
+  <title>Under the hood — GitCube</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="shell header-inner">
+  <a class="brand" href="./index.html" aria-label="GitCube home"><img src="./favicon.svg" alt="" width="36" height="36"><span>GitCube</span></a>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span><span></span></button>
+  <nav class="site-nav" id="site-nav" aria-label="Main navigation">
+    <a href="./index.html">Overview</a><a href="./features.html">Features</a><a href="./guide.html">User guide</a><a href="./architecture.html" aria-current="page">Under the hood</a><a class="nav-github" href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+  </nav>
+</div></header>
+  <main id="main"><section class="page-hero">
+  <div class="shell page-hero-inner">
+    <p class="eyebrow"><span class="eyebrow-mark"></span> UNDER THE HOOD</p>
+    <h1>Small moving parts, explicit boundaries.</h1>
+    <p>GitCube combines a local C++20 HTTP server, SQLite state, a bounded job worker pool, and the Git command line. The browser is a view onto local mirrors and persistent work.</p>
+    <div class="page-hero-actions"><a class="button button-primary" href="#flow">Follow a request <span aria-hidden="true">↓</span></a><a class="button button-secondary" href="#limits">Current limits <span aria-hidden="true">↓</span></a></div>
+  </div>
+</section>
+<div class="shell article-layout">
+  <nav class="page-toc" aria-label="On this page">
+    <span>ON THIS PAGE</span>
+    <a href="#flow">Request and job flow</a>
+    <a href="#storage">Storage layout</a>
+    <a href="#reliability">Reliability</a>
+    <a href="#security">Security boundary</a>
+    <a href="#limits">Current limits</a>
+  </nav>
+  <div class="article-content">
+    <section class="article-section" id="flow" aria-labelledby="flow-title">
+      <p class="section-kicker">01 / FLOW</p>
+      <h2 id="flow-title">A browser action becomes durable work.</h2>
+      <p>The hand-written HTTP/1.1 server accepts a request and passes it to the application router. Page handlers read SQLite to render the repository list, detail pages, and job history. Actions that change mirrors or refresh metadata insert a job first; worker threads claim and execute those jobs later.</p>
+      <div class="flow-diagram" aria-label="Browser request enters the HTTP server, reaches the application, writes a job to SQLite, and a worker invokes Git or curl">
+        <div><span>01</span><strong>Browser</strong><small>Page or action</small></div>
+        <div><span>02</span><strong>HTTP server</strong><small>Bounded connection pool</small></div>
+        <div><span>03</span><strong>Application</strong><small>Routes and CSRF checks</small></div>
+        <div><span>04</span><strong>SQLite job</strong><small>Persistent queue</small></div>
+        <div><span>05</span><strong>Worker</strong><small>Git, curl, or zip</small></div>
+      </div>
+      <p>Clone, fetch, health check, GitHub metadata refresh, and account import are queued jobs. File trees, blobs, commits, and archives are local reads from the mirror; these run during the browsing request rather than entering the network-work queue.</p>
+      <p>GitCube runs child commands with <code>posix_spawnp</code> and argument arrays, never by concatenating a shell command. The process wrapper captures output, enforces timeouts, and handles termination during shutdown.</p>
+    </section>
+
+    <section class="article-section" id="storage" aria-labelledby="storage-title">
+      <p class="section-kicker">02 / STORAGE</p>
+      <h2 id="storage-title">One data directory holds the collection.</h2>
+      <p>The SQLite database tracks repositories, jobs, refs, releases, and schema migrations. Bare mirrors live in paths based on repository IDs; temporary clone staging and exports are kept separately.</p>
+      <div class="code-panel"><div class="code-header"><span><span class="terminal-dot"></span> Data directory</span></div><pre><code>data/
+├── gitcube.sqlite3
+├── gitcube.lock
+├── repositories/
+│   └── by-id/42.git/
+├── tmp/
+├── cache/
+└── logs/</code></pre></div>
+      <p>The database uses WAL mode and a thread-safe connection pool. Schema changes are applied as ordered migrations, including when a database is created for the first time. Startup verifies essential columns so a mismatch fails clearly rather than surfacing later during a request.</p>
+      <div class="callout"><strong>No checkout on disk</strong><p>GitCube stores a bare mirror: Git objects, refs, and history. The file browser reads tree and blob objects directly. A worktree is never created just to show repository content.</p></div>
+    </section>
+
+    <section class="article-section" id="reliability" aria-labelledby="reliability-title">
+      <p class="section-kicker">03 / RELIABILITY</p>
+      <h2 id="reliability-title">Incomplete work stays incomplete.</h2>
+      <p>A clone starts under <code>data/tmp</code> and moves into its final mirror path only after <code>git clone --mirror</code> succeeds. An interrupted clone cannot appear as a ready mirror. A hard crash can leave staging files, which GitCube removes on the next start.</p>
+      <p>The queue records work before a worker starts it. On graceful shutdown, GitCube stops accepting new requests and claims, gives active commands a short window to finish, then returns interrupted jobs to the queue. Per-repository locking prevents two workers from changing the same mirror at once.</p>
+      <div class="detail-grid">
+        <div><h3>Bounded work</h3><p>Worker count is configurable. Dashboard status requests are limited to visible repository IDs, and rendered refs, releases, job output, and history are capped to keep pages manageable.</p></div>
+        <div><h3>Separate failures</h3><p>Availability, running operation, local health, and metadata states are stored independently. A GitHub API error does not erase a valid local mirror.</p></div>
+      </div>
+      <p>GitHub rate-limit responses delay affected metadata work until a suitable retry time. Transient failures use bounded backoff rather than leaving a job running forever.</p>
+    </section>
+
+    <section class="article-section" id="security" aria-labelledby="security-title">
+      <p class="section-kicker">04 / SECURITY</p>
+      <h2 id="security-title">A local tool with a clear trust boundary.</h2>
+      <p>GitCube binds to loopback by default. It has no user login or built-in TLS, so the intended use is a single-user browser on the same machine. Binding to a non-loopback address requires explicit flags and still calls for authentication and HTTPS in front of GitCube.</p>
+      <ul class="check-list">
+        <li><strong>Restricted inputs.</strong> Repository URLs must use public HTTP(S), without embedded credentials. Ref names and repository-relative paths are validated before Git receives them.</li>
+        <li><strong>Protected actions.</strong> POST handlers require a per-process CSRF token; the HTTP server also checks allowed Host names and rejects browser requests explicitly marked cross-site.</li>
+        <li><strong>No shell interpolation.</strong> Git, curl, and zip receive controlled arguments and environment, so URL or path text cannot become shell syntax.</li>
+        <li><strong>Safe file display.</strong> Potentially executable raw formats such as HTML, SVG, and XML are served as plain text inside the GitCube origin.</li>
+      </ul>
+      <p>The HTTP server bounds clients and request time, and the GitHub JSON parser caps nesting depth. These limits are meant to keep a public repository or remote response from consuming unlimited resources.</p>
+    </section>
+
+    <section class="article-section" id="limits" aria-labelledby="limits-title">
+      <p class="section-kicker">05 / SCOPE</p>
+      <h2 id="limits-title">What this version does not try to do.</h2>
+      <div class="limits-grid">
+        <div><h3>Platforms and access</h3><p>Linux/Debian 13 is the supported target. GitCube is a localhost single-user application without built-in login or TLS.</p></div>
+        <div><h3>Repository sources</h3><p>Only public HTTP(S) repositories are supported. SSH URLs, private repositories, GitHub tokens, and credentials are outside the current scope.</p></div>
+        <div><h3>Browsing depth</h3><p>The Markdown renderer is a safe subset rather than full GitHub Flavored Markdown. There is no syntax highlighting, blame, or full-text code search.</p></div>
+        <div><h3>Hosting features</h3><p>GitCube does not synchronize pull requests, issues, or GitHub Actions. It is a mirror and browser, not a replacement for a code hosting service.</p></div>
+        <div><h3>Long-running actions</h3><p>Pausing affects future work, not a child command that is already running. There is no button to cancel one running job.</p></div>
+        <div><h3>Exports</h3><p>ZIP generation is limited to 500 MiB and one export at a time. Resumable and range downloads are not supported.</p></div>
+      </div>
+      <div class="article-next"><span>PROJECT SOURCE</span><h3>Read the implementation.</h3><p>The repository README goes deeper into routes, schema migrations, build options, and the source layout.</p><a class="button button-primary" href="https://github.com/robertvokac/git-cube/blob/develop/README.md" target="_blank" rel="noopener noreferrer">Open the README <span aria-hidden="true">↗</span></a></div>
+    </section>
+  </div>
+</div></main>
+  <footer class="site-footer"><div class="shell footer-inner">
+  <a class="brand footer-brand" href="./index.html"><img src="./favicon.svg" alt="" width="28" height="28"><span>GitCube</span></a>
+  <p>Local mirrors for public Git.</p>
+  <div class="footer-links"><a href="./features.html">Features</a><a href="./guide.html">Guide</a><a href="./architecture.html">Architecture</a><a href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">Source</a></div>
+</div></footer>
+</body>
+</html>

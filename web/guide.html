@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c1423">
+  <meta name="description" content="Build and run GitCube, add public repositories, browse mirrors, manage background jobs, and install the systemd user service.">
+  <title>User guide — GitCube</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header"><div class="shell header-inner">
+  <a class="brand" href="./index.html" aria-label="GitCube home"><img src="./favicon.svg" alt="" width="36" height="36"><span>GitCube</span></a>
+  <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span><span></span></button>
+  <nav class="site-nav" id="site-nav" aria-label="Main navigation">
+    <a href="./index.html">Overview</a><a href="./features.html">Features</a><a href="./guide.html" aria-current="page">User guide</a><a href="./architecture.html">Under the hood</a><a class="nav-github" href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+  </nav>
+</div></header>
+  <main id="main"><section class="page-hero">
+  <div class="shell page-hero-inner">
+    <p class="eyebrow"><span class="eyebrow-mark"></span> USER GUIDE</p>
+    <h1>From a clean build to your first mirror.</h1>
+    <p>Install GitCube on a Linux machine, add public repositories, and use the local dashboard to keep them organized. Start with a local build, then decide whether to keep it running as a user service.</p>
+    <div class="page-hero-actions"><a class="button button-primary" href="#build">Build and run <span aria-hidden="true">↓</span></a><a class="button button-secondary" href="#first-repository">First repository <span aria-hidden="true">↓</span></a></div>
+  </div>
+</section>
+<div class="shell article-layout">
+  <nav class="page-toc" aria-label="On this page">
+    <span>ON THIS PAGE</span>
+    <a href="#requirements">Requirements</a>
+    <a href="#build">Build and run</a>
+    <a href="#first-repository">Add repositories</a>
+    <a href="#daily-use">Daily use</a>
+    <a href="#service">Install as a service</a>
+    <a href="#options">Command-line options</a>
+    <a href="#shutdown">Shutdown and recovery</a>
+  </nav>
+  <div class="article-content">
+    <section class="article-section" id="requirements" aria-labelledby="requirements-title">
+      <p class="section-kicker">01 / PREPARE</p>
+      <h2 id="requirements-title">Start on Linux with a small dependency set.</h2>
+      <p>The current release is developed for Debian 13 and Linux/POSIX. It needs a C++20 compiler, CMake, Git, curl, zip, and SQLite development headers. There is no Node.js build step and no web framework to install.</p>
+      <div class="code-panel"><div class="code-header"><span><span class="terminal-dot"></span> Dependencies · Debian 13</span><button class="copy-button" type="button" data-copy-target="deps-code" aria-live="polite">Copy</button></div><pre id="deps-code"><code>sudo apt install build-essential cmake git curl zip libsqlite3-dev</code></pre></div>
+      <p>Clone the project repository or open an existing checkout before running the build commands. GitCube creates its persistent data directory on first run.</p>
+    </section>
+
+    <section class="article-section" id="build" aria-labelledby="build-title">
+      <p class="section-kicker">02 / RUN</p>
+      <h2 id="build-title">Build, test, and open the local server.</h2>
+      <p>Configure a Release build, compile it, run the test suite, and start the executable:</p>
+      <div class="code-panel"><div class="code-header"><span><span class="terminal-dot"></span> Build and test</span><button class="copy-button" type="button" data-copy-target="build-code" aria-live="polite">Copy</button></div><pre id="build-code"><code>cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
+./build/gitcube</code></pre></div>
+      <p>Open <a class="inline-link" href="http://127.0.0.1:9999" target="_blank" rel="noopener noreferrer">http://127.0.0.1:9999</a> on the same machine. GitCube binds to <code>127.0.0.1</code> by default and uses port <code>9999</code>.</p>
+      <div class="callout"><strong>Where does the collection live?</strong><p>By default, persistent data is stored under <code>$XDG_DATA_HOME/gitcube</code>, or <code>~/.local/share/gitcube</code> when <code>XDG_DATA_HOME</code> is unset. Use <code>--data-dir</code> to choose another location. GitCube locks the data directory so two instances cannot modify the same queue and mirrors at once.</p></div>
+    </section>
+
+    <section class="article-section" id="first-repository" aria-labelledby="first-repository-title">
+      <p class="section-kicker">03 / ADD</p>
+      <h2 id="first-repository-title">Bring repositories into your collection.</h2>
+      <ol class="instruction-list">
+        <li><strong>Open Add repository.</strong><span>Paste a public HTTP(S) Git URL, one per line. You can submit up to 500 non-empty lines at once.</span></li>
+        <li><strong>Check before adding, if useful.</strong><span>The Check a repository field finds an existing entry without leaving the page.</span></li>
+        <li><strong>Watch the jobs.</strong><span>Each new mirror is queued for cloning. A bare GitHub account URL imports its public repositories through a separate account job.</span></li>
+      </ol>
+      <div class="example-box"><span>ONE REPOSITORY</span><code>https://github.com/openeggbert/cna</code><span>ALL PUBLIC REPOSITORIES IN AN ACCOUNT</span><code>https://github.com/openeggbert</code></div>
+      <p>If a submitted repository is already known, GitCube skips it. SSH URLs, embedded credentials, and non-HTTP(S) schemes are rejected. GitHub URL variants are normalized so simple spelling differences do not create duplicate entries.</p>
+      <a class="text-link" href="./features.html#mirroring">More about imports and mirrors <span aria-hidden="true">→</span></a>
+    </section>
+
+    <section class="article-section" id="daily-use" aria-labelledby="daily-use-title">
+      <p class="section-kicker">04 / MANAGE</p>
+      <h2 id="daily-use-title">Use the dashboard as a working catalog.</h2>
+      <div class="detail-grid">
+        <div><h3>Find a repository</h3><p>Search by owner, name, host, or description. Filter by state, GitHub account, Git tag, or importance. The list is paginated at 25 repositories per page.</p></div>
+        <div><h3>Update and check</h3><p>Use <strong>Fetch</strong> or <strong>Health</strong> on one repository. From the home page, <strong>Fetch all</strong> and <strong>Check all</strong> queue eligible bulk work.</p></div>
+        <div><h3>Pause future work</h3><p>Pause a repository to skip new queued and bulk work. Resume it when ready. Pausing does not stop a child process that is already running.</p></div>
+        <div><h3>Set importance</h3><p>Assign 0–3 stars as a personal label. This helps sorting and filtering, but has no effect on scheduling.</p></div>
+      </div>
+      <p>On a repository page, choose <strong>Files</strong> or <strong>Commits</strong> to browse a branch or tag directly from the bare mirror. The file listing can render a root README; commit pages expose patches and file statistics. The <strong>Export</strong> controls provide either a files-only snapshot or the complete re-clonable mirror.</p>
+      <p>GitHub metadata can be refreshed separately. If the public GitHub API is temporarily limited, the metadata job waits while the local mirror remains usable.</p>
+    </section>
+
+    <section class="article-section" id="service" aria-labelledby="service-title">
+      <p class="section-kicker">05 / INSTALL</p>
+      <h2 id="service-title">Run GitCube as a user service.</h2>
+      <p>For a user-local installation, choose the final prefix during CMake configuration. The generated systemd user unit uses that configured absolute path.</p>
+      <div class="code-panel"><div class="code-header"><span><span class="terminal-dot"></span> Install under your home directory</span><button class="copy-button" type="button" data-copy-target="service-code" aria-live="polite">Copy</button></div><pre id="service-code"><code>cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build build-release --parallel 2
+cmake --install build-release
+systemctl --user daemon-reload
+systemctl --user enable --now gitcube.service</code></pre></div>
+      <p>This places the binary under <code>~/.local/bin</code>, documentation under <code>~/.local/share/doc/gitcube</code>, and the unit under <code>~/.local/share/systemd/user</code>. Installation alone does not enable or start the service; the last command does that explicitly.</p>
+      <p>The example service uses two Git workers and stores data under <code>~/.local/share/gitcube</code>. You can customize its limits and options with a systemd user override.</p>
+    </section>
+
+    <section class="article-section" id="options" aria-labelledby="options-title">
+      <p class="section-kicker">06 / CONFIGURE</p>
+      <h2 id="options-title">Choose the data path, port, and worker count.</h2>
+      <div class="table-scroll"><table class="comparison-table"><thead><tr><th>Option</th><th>Purpose</th><th>Default</th></tr></thead><tbody>
+        <tr><td><code>--data-dir PATH</code></td><td>Persistent database, mirrors, cache, and temporary files</td><td><code>$XDG_DATA_HOME/gitcube</code> or <code>~/.local/share/gitcube</code></td></tr>
+        <tr><td><code>--port PORT</code></td><td>HTTP listening port</td><td><code>9999</code></td></tr>
+        <tr><td><code>--workers COUNT</code></td><td>Concurrent Git job workers</td><td><code>2</code></td></tr>
+        <tr><td><code>--bind ADDRESS</code></td><td>IPv4 listening address</td><td><code>127.0.0.1</code></td></tr>
+        <tr><td><code>--allowed-host H</code></td><td>Additional accepted HTTP Host name; repeatable</td><td>None</td></tr>
+      </tbody></table></div>
+      <p>A non-loopback bind additionally requires <code>--allow-remote-unauthenticated</code> and an allowed host. Because GitCube has no login or TLS, use it as a local single-user tool unless you have an appropriate authenticated HTTPS layer in front of it.</p>
+      <div class="code-panel"><div class="code-header"><span><span class="terminal-dot"></span> Example custom run</span><button class="copy-button" type="button" data-copy-target="options-code" aria-live="polite">Copy</button></div><pre id="options-code"><code>./build/gitcube --data-dir /mnt/archive/gitcube --port 9999 --workers 4</code></pre></div>
+    </section>
+
+    <section class="article-section" id="shutdown" aria-labelledby="shutdown-title">
+      <p class="section-kicker">07 / RECOVER</p>
+      <h2 id="shutdown-title">Stop safely; let queued work resume.</h2>
+      <p>Use Ctrl+C in the terminal or send <code>SIGTERM</code>. GitCube stops accepting requests and new jobs, gives active Git or curl commands a short chance to finish, then terminates them if needed. Interrupted work is returned to the queue for the next start.</p>
+      <p>On startup, GitCube removes orphaned partial-clone directories and temporary export files left by a hard crash. The persistent database and completed mirrors remain in the data directory.</p>
+      <div class="article-next"><span>GO DEEPER</span><h3>How does GitCube keep this reliable?</h3><p>Read about the job flow, storage layout, and local security boundary.</p><a class="button button-primary" href="./architecture.html">Under the hood <span aria-hidden="true">→</span></a></div>
+    </section>
+  </div>
+</div></main>
+  <footer class="site-footer"><div class="shell footer-inner">
+  <a class="brand footer-brand" href="./index.html"><img src="./favicon.svg" alt="" width="28" height="28"><span>GitCube</span></a>
+  <p>Local mirrors for public Git.</p>
+  <div class="footer-links"><a href="./features.html">Features</a><a href="./guide.html">Guide</a><a href="./architecture.html">Architecture</a><a href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">Source</a></div>
+</div></footer>
+</body>
+</html>

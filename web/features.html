@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0c1423">
+  <meta name="description" content="Explore GitCube's public Git mirroring, repository catalog, browsing, background jobs, health checks, GitHub metadata, and export options.">
+  <title>Features — GitCube</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./script.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+  <div class="shell header-inner">
+    <a class="brand" href="./index.html" aria-label="GitCube home"><img src="./favicon.svg" alt="" width="36" height="36"><span>GitCube</span></a>
+    <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav" aria-label="Open menu"><span></span><span></span><span></span></button>
+    <nav class="site-nav" id="site-nav" aria-label="Main navigation">
+      <a href="./index.html">Overview</a>
+      <a href="./features.html" aria-current="page">Features</a>
+      <a href="./guide.html">User guide</a>
+      <a href="./architecture.html">Under the hood</a>
+      <a class="nav-github" href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">GitHub <span aria-hidden="true">↗</span></a>
+    </nav>
+  </div>
+</header>
+  <main id="main"><section class="page-hero">
+  <div class="shell page-hero-inner">
+    <p class="eyebrow"><span class="eyebrow-mark"></span> FEATURES</p>
+    <h1>Everything around the mirror, in one place.</h1>
+    <p>GitCube keeps a collection of public repositories usable after the initial clone. It tracks work, makes bare mirrors browsable, and gives you explicit ways to check and export them.</p>
+    <div class="page-hero-actions"><a class="button button-primary" href="./guide.html">Start using GitCube <span aria-hidden="true">→</span></a><a class="button button-secondary" href="#mirroring">Explore the details <span aria-hidden="true">↓</span></a></div>
+  </div>
+</section>
+<div class="shell article-layout">
+  <nav class="page-toc" aria-label="On this page">
+    <span>ON THIS PAGE</span>
+    <a href="#mirroring">Mirroring and importing</a>
+    <a href="#catalog">Repository catalog</a>
+    <a href="#browsing">Files and history</a>
+    <a href="#jobs">Jobs and health</a>
+    <a href="#github">GitHub metadata</a>
+    <a href="#exporting">Export options</a>
+  </nav>
+  <div class="article-content">
+    <section class="article-section" id="mirroring" aria-labelledby="mirroring-title">
+      <p class="section-kicker">01 / MIRRORING</p>
+      <h2 id="mirroring-title">Add one repository or an entire public account.</h2>
+      <p>GitCube accepts public HTTP(S) Git URLs from GitHub and other hosts. Paste one URL per line on the <strong>Add repository</strong> page; a submission can contain up to 500 non-empty lines. Existing repositories are skipped rather than cloned again.</p>
+      <div class="example-box"><span>INDIVIDUAL REPOSITORY</span><code>https://github.com/openeggbert/cna</code><span>GITHUB ACCOUNT OR ORGANIZATION</span><code>https://github.com/openeggbert</code></div>
+      <p>A bare GitHub account URL starts an import job. GitCube follows the GitHub API's paginated results and queues each new public repository for cloning. It saves each page as it goes, so a large account does not require holding the whole list in memory.</p>
+      <p>Before adding a URL, <strong>Check a repository</strong> can tell you whether it is already in the collection and take you to its detail page. GitCube normalizes equivalent GitHub URL variants, including case, trailing slashes, and a final <code>.git</code>, to avoid duplicate records.</p>
+      <div class="callout"><strong>What gets stored?</strong><p>Each successful clone is a bare mirror created with <code>git clone --mirror</code>. There is no checked-out worktree. New mirrors are stored by database ID, so different repository names cannot collide on disk.</p></div>
+    </section>
+
+    <section class="article-section" id="catalog" aria-labelledby="catalog-title">
+      <p class="section-kicker">02 / ORGANIZATION</p>
+      <h2 id="catalog-title">Find the right repository and read its state.</h2>
+      <p>The repository list shows 25 entries per page. Search matches owner, name, host, or description. Filters narrow the view by state, GitHub account, Git tag, and a personal importance rating.</p>
+      <div class="detail-grid">
+        <div><h3>Independent status</h3><p>Local availability, active operation, health check, and GitHub metadata each have their own state and error. A metadata failure does not hide a mirror that is ready to browse locally.</p></div>
+        <div><h3>Live visible rows</h3><p>Open dashboard tabs poll lightweight status for only the repositories on their current page every two seconds. Active and queued job counts update without a full page reload.</p></div>
+        <div><h3>Importance you control</h3><p>Set 0–3 stars on a repository: undefined, low, medium, or high. The rating can be filtered and sorted, but does not alter worker scheduling.</p></div>
+        <div><h3>Pause when needed</h3><p>Pausing a repository skips new queued and bulk work for it. A command that is already running is allowed to finish.</p></div>
+      </div>
+      <p>A repository detail page brings together status, description, stars, forks, license, releases, disk usage, actions, and links into its files and commits.</p>
+    </section>
+
+    <section class="article-section" id="browsing" aria-labelledby="browsing-title">
+      <p class="section-kicker">03 / BROWSING</p>
+      <h2 id="browsing-title">Explore a bare mirror without checking it out.</h2>
+      <p>Choose a branch or tag, then move through its file tree. Entries show name, type, size, and a short object ID. A root <code>README.md</code> is rendered below the listing. Markdown files opened directly are rendered too, using a deliberately limited safe subset.</p>
+      <p>Text files are escaped and shown plainly; binary files offer a raw download. The commits view lists up to 200 commits for the selected ref, and an individual commit shows its metadata, file statistics, and patch. GitCube reads all of this from the local bare mirror.</p>
+      <div class="callout"><strong>Bounded pages</strong><p>To keep a detail response manageable, GitCube renders at most 500 branches, 500 tags, and the 200 latest GitHub releases on one page. The full stored ref and release data is still retained.</p></div>
+    </section>
+
+    <section class="article-section" id="jobs" aria-labelledby="jobs-title">
+      <p class="section-kicker">04 / OPERATIONS</p>
+      <h2 id="jobs-title">See what work is queued, running, or finished.</h2>
+      <p>Clone, fetch, health, metadata refresh, and account import run as persistent jobs in SQLite. A configurable worker pool claims them in the background. <strong>Fetch all</strong> and <strong>Check all</strong> queue work for eligible, unpaused repositories.</p>
+      <p>A health check first tests whether the remote can be reached and then runs <code>git fsck --full --no-dangling</code> on the local mirror. The job history can be filtered by queued, running, success, failed, or interrupted status and shows timestamps, attempts, messages, and failure output.</p>
+      <p>GitCube retains the latest 5,000 finished jobs and full command output for the latest 200. Active and queued jobs are not pruned. If the process is stopped gracefully, interrupted work returns to the queue for the next start.</p>
+      <a class="text-link" href="./architecture.html#reliability">How jobs recover <span aria-hidden="true">→</span></a>
+    </section>
+
+    <section class="article-section" id="github" aria-labelledby="github-title">
+      <p class="section-kicker">05 / GITHUB INTEGRATION</p>
+      <h2 id="github-title">Metadata is useful, but the mirror comes first.</h2>
+      <p>For GitHub repositories, GitCube fetches public descriptions, stars, forks, license information, and paginated release history through the unauthenticated GitHub API. No token is needed, but the API is rate-limited.</p>
+      <p>When GitHub reports a rate limit, GitCube reschedules the affected job and other pending GitHub API work based on the reported reset time. Temporary network and server failures use bounded retries. Your local mirror remains available for cloning, fetching, and browsing even when metadata cannot be refreshed yet.</p>
+    </section>
+
+    <section class="article-section" id="exporting" aria-labelledby="exporting-title">
+      <p class="section-kicker">06 / EXPORT</p>
+      <h2 id="exporting-title">Choose files or the full Git mirror.</h2>
+      <p>The repository detail page offers two ZIP downloads. They serve different purposes:</p>
+      <div class="table-scroll"><table class="comparison-table"><thead><tr><th>Download</th><th>Contains</th><th>Use it when</th></tr></thead><tbody><tr><td><strong>Files from a branch or tag</strong></td><td>The selected tree only, created with <code>git archive</code>. No <code>.git</code> history.</td><td>You need a snapshot of the project files.</td></tr><tr><td><strong>Whole bare mirror</strong></td><td>Refs, objects, packs, and history as stored in the mirror.</td><td>You want a portable copy that can be extracted and cloned again.</td></tr></tbody></table></div>
+      <p>Exports are streamed from temporary owner-only files. Each export is capped at 500 MiB, and only one export runs at a time. Temporary files are removed after the transfer, on disconnect, or at the next startup after a hard crash.</p>
+      <div class="article-next"><span>NEXT</span><h3>Ready to try it?</h3><p>Build GitCube, add a public repository, and explore your first mirror.</p><a class="button button-primary" href="./guide.html">Follow the user guide <span aria-hidden="true">→</span></a></div>
+    </section>
+  </div>
+</div></main>
+  <footer class="site-footer">
+  <div class="shell footer-inner">
+    <a class="brand footer-brand" href="./index.html"><img src="./favicon.svg" alt="" width="28" height="28"><span>GitCube</span></a>
+    <p>Local mirrors for public Git.</p>
+    <div class="footer-links"><a href="./features.html">Features</a><a href="./guide.html">Guide</a><a href="./architecture.html">Architecture</a><a href="https://github.com/robertvokac/git-cube" target="_blank" rel="noopener noreferrer">Source</a></div>
+  </div>
+</footer>
+</body>
+</html>

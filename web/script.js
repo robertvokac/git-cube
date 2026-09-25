@@ -26,10 +26,34 @@ if (menuButton && navigation) {
   window.matchMedia('(min-width: 761px)').addEventListener('change', closeMenu);
 }
 
-const copyButton = document.querySelector('.copy-button');
-const commandBlock = document.getElementById('quick-start-code');
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return;
+    } catch {
+      // The fallback also works when the page is opened directly from disk.
+    }
+  }
 
-if (copyButton && commandBlock) {
+  const fallback = document.createElement('textarea');
+  fallback.value = text;
+  fallback.style.position = 'fixed';
+  fallback.style.opacity = '0';
+  document.body.append(fallback);
+  fallback.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('Clipboard unavailable');
+  } finally {
+    fallback.remove();
+  }
+}
+
+for (const copyButton of document.querySelectorAll('[data-copy-target]')) {
+  const commandBlock = document.getElementById(copyButton.dataset.copyTarget);
+  if (!commandBlock) continue;
+
+  const originalLabel = copyButton.textContent;
   let resetTimer;
   copyButton.addEventListener('click', async () => {
     const commands = commandBlock.textContent
@@ -38,19 +62,7 @@ if (copyButton && commandBlock) {
       .join('\n');
 
     try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(commands);
-      } else {
-        const fallback = document.createElement('textarea');
-        fallback.value = commands;
-        fallback.style.position = 'fixed';
-        fallback.style.opacity = '0';
-        document.body.append(fallback);
-        fallback.select();
-        const copied = document.execCommand('copy');
-        fallback.remove();
-        if (!copied) throw new Error('Clipboard unavailable');
-      }
+      await copyText(commands);
       copyButton.textContent = 'Copied!';
     } catch {
       copyButton.textContent = 'Copy failed';
@@ -58,7 +70,7 @@ if (copyButton && commandBlock) {
 
     clearTimeout(resetTimer);
     resetTimer = setTimeout(() => {
-      copyButton.textContent = 'Copy commands';
+      copyButton.textContent = originalLabel;
     }, 2200);
   });
 }
