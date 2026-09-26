@@ -123,6 +123,10 @@ UPDATE releases SET
  html_url=substr(html_url,1,2048),
  published_at=substr(published_at,1,128);
 )SQL"},
+    {9, R"SQL(
+ALTER TABLE repositories ADD COLUMN group_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE repositories ADD COLUMN note TEXT NOT NULL DEFAULT '';
+)SQL"},
 };
 
 constexpr std::size_t kMaxJobMessageBytes = 16 * 1024;
@@ -133,6 +137,8 @@ constexpr std::size_t kRetainedFinishedJobs = 5000;
 constexpr std::size_t kRetainedJobOutputs = 200;
 constexpr std::size_t kMaxRepositoryErrorBytes = 64 * 1024;
 constexpr std::size_t kMaxDescriptionBytes = 16 * 1024;
+constexpr std::size_t kMaxRepositoryGroupBytes = 256;
+constexpr std::size_t kMaxRepositoryNoteBytes = 16 * 1024;
 constexpr std::size_t kMaxUrlBytes = 2048;
 constexpr std::size_t kMaxDefaultBranchBytes = 4096;
 constexpr std::size_t kMaxLicenseBytes = 1024;
@@ -281,7 +287,7 @@ void verify_schema(Connection& db) {
         }
     };
     require_columns("repositories", {"id", "storage_relpath", "canonical_url",
-                                      "importance", "operation",
+                                      "importance", "operation", "group_name", "note",
                                       "health_status", "health_error", "metadata_status",
                                       "metadata_error", "branch_count", "tag_count",
                                       "object_count"});
@@ -383,6 +389,8 @@ Repository read_repository(Statement& stmt) {
     r.tag_count = stmt.integer(c++);
     r.object_count = stmt.integer(c++);
     r.importance = stmt.int_value(c++);
+    r.group = stmt.text(c++);
+    r.note = stmt.text(c++);
     return r;
 }
 
@@ -392,7 +400,8 @@ const char* repository_columns = R"SQL(
  paused, is_github, default_branch, description, homepage, html_url, license,
  archived, is_fork, stars, forks, open_issues, github_repo_id, created_at,
  updated_at, pushed_at, metadata_fetched_at, last_fetch_at, last_success_at,
- last_health_at, last_error, head_oid, branch_count, tag_count, object_count, importance
+ last_health_at, last_error, head_oid, branch_count, tag_count, object_count, importance,
+ group_name, note
 )SQL";
 
 Job read_job(Statement& stmt) {
@@ -756,6 +765,7 @@ WHERE (?1 = '' OR owner LIKE '%'||?1||'%' ESCAPE '\' OR name LIKE '%'||?1||'%' E
           AND refs.name LIKE '%'||?4||'%' ESCAPE '\'
       ))
   AND (?5 = '' OR importance = CAST(?5 AS INTEGER))
+  AND (?6 = '' OR group_name LIKE '%'||?6||'%' ESCAPE '\')
 )SQL";
 
 void bind_repository_filter(Statement& stmt, const RepositoryFilter& filter) {
@@ -764,6 +774,7 @@ void bind_repository_filter(Statement& stmt, const RepositoryFilter& filter) {
     stmt.bind(3, filter.account);
     stmt.bind(4, filter.tag);
     stmt.bind(5, filter.importance);
+    stmt.bind(6, filter.group);
 }
 
 } // namespace
@@ -781,10 +792,10 @@ RepositoryPage Database::list_repositories_page(const RepositoryFilter& filter, 
 
     Statement stmt(db.get(), std::string("SELECT ") + repository_columns + " FROM repositories " +
         kRepositoryFilterWhere +
-        " ORDER BY host COLLATE NOCASE, owner COLLATE NOCASE, name COLLATE NOCASE LIMIT ?6 OFFSET ?7");
+        " ORDER BY host COLLATE NOCASE, owner COLLATE NOCASE, name COLLATE NOCASE LIMIT ?7 OFFSET ?8");
     bind_repository_filter(stmt, filter);
-    stmt.bind(6, static_cast<std::int64_t>(per_page));
-    stmt.bind(7, static_cast<std::int64_t>((page - 1) * per_page));
+    stmt.bind(7, static_cast<std::int64_t>(per_page));
+    stmt.bind(8, static_cast<std::int64_t>((page - 1) * per_page));
     while (stmt.step_row()) result.items.push_back(read_repository(stmt));
     return result;
 }
@@ -839,6 +850,18 @@ bool Database::set_repository_importance(std::int64_t id, int importance) {
     stmt.bind(1, importance);
     stmt.bind(2, now_utc());
     stmt.bind(3, id);
+    stmt.step_done();
+    return sqlite3_changes(db.get()) > 0;
+}
+
+bool Database::set_repository_group_and_note(std::int64_t id, const std::string& group,
+                                             const std::string& note) {
+    ConnectionLease db(pool_, path_);
+    Statement stmt(db.get(), "UPDATE repositories SET group_name=?, note=?, modified_at=? WHERE id=?");
+    stmt.bind(1, group.substr(0, kMaxRepositoryGroupBytes));
+    stmt.bind(2, note.substr(0, kMaxRepositoryNoteBytes));
+    stmt.bind(3, now_utc());
+    stmt.bind(4, id);
     stmt.step_done();
     return sqlite3_changes(db.get()) > 0;
 }

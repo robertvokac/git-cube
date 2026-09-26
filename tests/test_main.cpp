@@ -435,7 +435,7 @@ SET normalized_url='http://WWW.GITHUB.COM:80/OpenEggbert/CNA.GIT/';
             identity_db.initialize();
             require(query_integer(
                         temp / "identity.sqlite3",
-                        "SELECT max(version) FROM schema_migrations") == 8,
+                        "SELECT max(version) FROM schema_migrations") == 9,
                     "Fresh database did not reach the expected schema version");
             const auto punctuation = identity_db.add_repository(*encoded_name);
             const auto underscore = identity_db.add_repository(*underscore_name);

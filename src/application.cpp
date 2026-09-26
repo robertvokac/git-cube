@@ -352,7 +352,7 @@ HttpResponse Application::handle_request(const HttpRequest& request) {
         return request.method == "GET" ? repository_disk_usage_api(*id)
                                        : HttpResponse::text("Method not allowed", 405);
     }
-    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance|delete)$)"))) {
+    if (std::regex_match(request.path, match, std::regex(R"(^/repo/([0-9]+)/(fetch|health|metadata|pause|resume|clone|importance|details|delete)$)"))) {
         const auto id = parse_id(match);
         if (!id) return HttpResponse::text("Invalid repository id", 400);
         return request.method == "POST" ? repository_action(*id, match[2].str(), request)
@@ -424,6 +424,7 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     filter.account = query_value(request, "account");
     filter.tag = query_value(request, "tag");
     filter.importance = query_value(request, "importance");
+    filter.group = query_value(request, "group");
     std::size_t page_number = 1;
     try { page_number = std::max<std::size_t>(1, std::stoull(query_value(request, "page", "1"))); } catch (...) {}
     constexpr std::size_t per_page = 25;
@@ -467,8 +468,10 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
              << importance_label(level) << "</option>";
     }
     body << "</select></div>"
+         << "<div class=\"field\"><label for=\"f-group\">Group</label><input id=\"f-group\" type=\"text\" name=\"group\" value=\""
+         << html_escape(filter.group) << "\" placeholder=\"Group\"></div>"
          << "<div class=\"field\"><button type=\"submit\">Filter</button></div>";
-    if (!filter.search.empty() || !filter.status.empty() || !filter.account.empty() || !filter.tag.empty() || !filter.importance.empty()) {
+    if (!filter.search.empty() || !filter.status.empty() || !filter.account.empty() || !filter.tag.empty() || !filter.importance.empty() || !filter.group.empty()) {
         body << "<div class=\"field\"><a class=\"button secondary\" href=\"/\">Clear</a></div>";
     }
     body << "</form>";
@@ -476,14 +479,14 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
     if (listing.items.empty()) {
         body << "<p>No repositories match.</p>";
     } else {
-        body << "<table><thead><tr><th>Repository</th><th>Account</th><th>Importance</th><th>Status</th><th>Refs</th><th>Last success</th><th>Metadata</th></tr></thead><tbody>";
+        body << "<table><thead><tr><th>Repository</th><th>Group</th><th>Account</th><th>Importance</th><th>Status</th><th>Refs</th><th>Last success</th><th>Metadata</th></tr></thead><tbody>";
         for (const auto& repo : listing.items) {
             const std::string shown_status = display_status(repo);
             const std::string shown_error = display_error(repo);
             body << "<tr><td><a class=\"repo-name\" href=\"/repo/" << repo.id << "\">" << html_escape(repo.owner + "/" + repo.name)
                  << "</a><br><span class=\"muted\">" << html_escape(repo.host) << "</span>";
             if (!repo.description.empty()) body << "<div class=\"description muted\">" << html_escape(clip(repo.description, 180)) << "</div>";
-            body << "</td><td>" << (repo.github ? html_escape(repo.owner) : "") << "</td>";
+            body << "</td><td>" << html_escape(repo.group) << "</td><td>" << (repo.github ? html_escape(repo.owner) : "") << "</td>";
             body << "<td>" << importance_stars_html(repo.importance) << "</td>";
             body << "<td><span data-repo-status=\"" << repo.id << "\" class=\"badge " << status_css(shown_status) << "\">"
                  << html_escape(status_label(shown_status)) << (repo.paused ? " · paused" : "") << "</span>";
@@ -498,7 +501,7 @@ HttpResponse Application::dashboard(const HttpRequest& request) {
 
         const std::string base = "/?q=" + url_encode(filter.search) + "&status=" + url_encode(filter.status) +
             "&account=" + url_encode(filter.account) + "&tag=" + url_encode(filter.tag) +
-            "&importance=" + url_encode(filter.importance) + "&page=";
+            "&importance=" + url_encode(filter.importance) + "&group=" + url_encode(filter.group) + "&page=";
         body << "<div class=\"pagination\">";
         if (page_number > 1) body << "<a class=\"button secondary\" href=\"" << base << (page_number - 1) << "\">← Previous</a>";
         else body << "<span></span>";
@@ -669,6 +672,11 @@ HttpResponse Application::repository_page(std::int64_t id) {
     }
     body << "</select><button type=\"submit\" class=\"secondary\">Set</button>" << importance_stars_html(repo->importance)
          << "</form></td></tr>";
+    body << "<tr><th>Group and note</th><td><form method=\"post\" action=\"/repo/" << id
+         << "/details\"><input type=\"hidden\" name=\"csrf\" value=\"" << html_escape(csrf_token_)
+         << "\"><label for=\"repo-group\">Group</label><input id=\"repo-group\" name=\"group\" maxlength=\"256\" value=\""
+         << html_escape(repo->group) << "\"><label for=\"repo-note\">Note</label><textarea id=\"repo-note\" name=\"note\" rows=\"5\" maxlength=\"16384\">"
+         << html_escape(repo->note) << "</textarea><button type=\"submit\" class=\"secondary\">Save</button></form></td></tr>";
     body << "<tr><th>Export</th><td><div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap\">"
          << "<form method=\"post\" action=\"/repo/" << id
          << "/archive\" style=\"display:flex;gap:10px;align-items:center\"><input type=\"hidden\" name=\"csrf\" value=\""
@@ -1079,6 +1087,14 @@ HttpResponse Application::repository_action(std::int64_t id, const std::string& 
         }
         database_.set_repository_importance(id, importance);
         notice = "Importance set to " + std::string(importance_label(importance));
+    } else if (action == "details") {
+        const auto form = parse_urlencoded(request.body);
+        const auto group = form.find("group");
+        const auto note = form.find("note");
+        database_.set_repository_group_and_note(id,
+            group == form.end() ? std::string{} : group->second,
+            note == form.end() ? std::string{} : note->second);
+        notice = "Repository details saved";
     } else if (action == "delete") {
         if (!database_.delete_repository(id)) {
             return HttpResponse::redirect("/?error=" + url_encode("Repository no longer exists"));

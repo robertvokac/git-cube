@@ -54,6 +54,8 @@ struct Repository {
     std::int64_t object_count = 0;
     // 0 = undefined, 1 = low, 2 = medium, 3 = high.
     int importance = 0;
+    std::string group;
+    std::string note;
 };
 
 struct Job {
@@ -106,6 +108,7 @@ struct RepositoryFilter {
     std::string account;    // GitHub owner (substring); only matches is_github=1 rows
     std::string tag;        // matches a git tag name on the repository (substring)
     std::string importance; // "0".."3", exact match; empty = any
+    std::string group;      // substring match, empty = any
 };
 
 struct RepositoryPage {
@@ -157,6 +160,8 @@ public:
 
     bool set_repository_paused(std::int64_t id, bool paused);
     bool set_repository_importance(std::int64_t id, int importance);
+    bool set_repository_group_and_note(std::int64_t id, const std::string& group,
+                                       const std::string& note);
     void set_repository_operation(std::int64_t id, const std::string& operation);
     void update_repository_status(std::int64_t id, const std::string& status,
                                   const std::string& error = {});
